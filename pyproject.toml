@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-tts-megakernel"
+version = "0.1.0"
+description = "Qwen3-TTS with RTX 5090 megakernel acceleration — fast single-kernel decode fused with the full TTS pipeline"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Alibaba Qwen Team" },
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  # core
+  "torch>=2.0.0",
+  "torchaudio",
+  "transformers==4.57.3",
+  "accelerate==1.12.0",
+  # megakernel JIT build (triton not available on macOS — optional)
+  "ninja",
+  # TTS pipeline
+  "gradio",
+  "librosa",
+  "soundfile",
+  "sox",
+  "onnxruntime",
+  "einops",
+]
+
+[project.urls]
+Repository = "https://github.com/synciq-ai/qwen3-tts-megakernel"
+
+[project.scripts]
+qwen-tts-demo = "qwen_tts.cli.demo:main"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["qwen_megakernel*", "qwen_tts*"] } }
+include-package-data = true
+
+[tool.setuptools.package-data]
+qwen_tts = ["py.typed", "**/*.npz"]
