@@ -199,7 +199,7 @@ def load_code_predictor_weights(hf_model) -> dict:
     # Optional input projection (created only when cp_hidden != talker_hidden).
     proj_weight = None
     proj_bias = None
-    if hasattr(cp, "small_to_mtp_projection"):
+    if hasattr(cp, "small_to_mtp_projection") and hasattr(cp.small_to_mtp_projection, "weight"):
         proj_weight = cp.small_to_mtp_projection.weight.contiguous()
         proj_bias = cp.small_to_mtp_projection.bias.contiguous()
 
