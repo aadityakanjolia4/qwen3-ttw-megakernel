@@ -69,6 +69,8 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         sample_rate: int = 16000,
         verbose: bool = True,
         tts_instance: Optional[object] = None,
+        connection: Optional[object] = None,
+        timing: Optional[dict] = None,
     ):
         if _PIPECAT_AVAILABLE:
             super().__init__(
@@ -85,10 +87,11 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         self._target_sr = sample_rate
         self._verbose = verbose
         self._model_name = model_name
+        self._connection = connection   # SmallWebRTCConnection for sending metrics
+        self._timing = timing           # shared dict with "vad_end_ts" written by observer
 
         # Accept a pre-loaded instance (passed from server startup) or lazy-load.
         self._tts: Optional[object] = tts_instance
-        self._last_rtf: Optional[float] = None
 
     def _ensure_loaded(self):
         if self._tts is None:
@@ -113,9 +116,12 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         queue: asyncio.Queue = asyncio.Queue()
 
         total_samples = 0
+        first_chunk_ts: list[float] = []  # mutable container for thread callback
 
         def on_chunk(audio: np.ndarray, sr: int) -> None:
             nonlocal total_samples
+            if not first_chunk_ts:
+                first_chunk_ts.append(time.perf_counter())
             total_samples += len(audio)
             pcm = _to_pcm16(audio, src_sr=sr, dst_sr=self._target_sr)
             frame = AudioRawFrame(
@@ -151,18 +157,21 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         # Propagate any GPU/synthesis exception.
         await synthesis_future
 
-        elapsed = (time.perf_counter() - t0)
-        if total_samples > 0:
+        elapsed = time.perf_counter() - t0
+
+        if self._connection is not None and total_samples > 0:
+            # TTFC: speech-end → first audio chunk generated inside synthesis thread.
+            if first_chunk_ts and self._timing and self._timing.get("vad_end_ts"):
+                ttfc_ms = (first_chunk_ts[0] - self._timing["vad_end_ts"]) * 1000
+                self._connection.send_app_message({"type": "log", "msg": f"TTFC: {ttfc_ms:.0f} ms"})
+
+            # RTF: total synthesis time / audio duration.
             audio_duration = total_samples / self._target_sr
             rtf = elapsed / audio_duration
+            self._connection.send_app_message({"type": "log", "msg": f"RTF: {rtf:.3f}"})
+
             if self._verbose:
-                print(
-                    f"[MegakernelTTSService] '{sentence[:40]}' → "
-                    f"{elapsed * 1000:.0f} ms  RTF={rtf:.3f}"
-                )
-            self._last_rtf = rtf
-        else:
-            self._last_rtf = None
+                print(f"[TTS] '{sentence[:40]}' TTFC={ttfc_ms:.0f}ms RTF={rtf:.3f}")
 
     # ------------------------------------------------------------------
     # Standalone (non-pipecat) usage
