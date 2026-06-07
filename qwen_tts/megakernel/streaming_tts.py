@@ -221,21 +221,11 @@ class StreamingTTSMegakernel:
             )  # [1, 1, hidden]
 
             sub_input = torch.cat([mk_hidden.to(dtype), last_id_hidden], dim=1)
-            sub_result = self._code_predictor.generate(
-                inputs_embeds=sub_input,
-                max_new_tokens=self._num_code_groups - 1,
-                do_sample=do_sample,
-                top_k=top_k if do_sample else 1,
-                top_p=top_p if do_sample else 1.0,
-                temperature=temperature if do_sample else 1.0,
-                output_hidden_states=False,
-                return_dict_in_generate=True,
-            )
+            extra_groups = self._sub_talker_decode(
+                sub_input, do_sample, top_k, top_p, temperature
+            )  # [1, num_code_groups-1]
             torch.cuda.synchronize()
             t_decode_accum += time.perf_counter() - _t0
-
-            # Assemble all codec groups for this frame.
-            extra_groups = sub_result.sequences  # [1, num_code_groups-1]
             all_groups = torch.cat(
                 [
                     torch.tensor([[codec_token_0]], device=device),
@@ -386,6 +376,74 @@ class StreamingTTSMegakernel:
             trailing_text_hidden = tts_eos_embed
 
         return prefill_embeds.to(dtype), trailing_text_hidden.to(dtype), tts_pad_embed.to(dtype)
+
+    def _sub_talker_decode(
+        self,
+        sub_input: torch.Tensor,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Run code_predictor autoregressively without HF generate overhead.
+
+        Each of the 31 steps uses a different lm_head[g] and codec_embedding[g-1],
+        so the loop is inherently sequential — but we bypass all of HF GenerationMixin
+        (stopping criteria, beam machinery, logits processor pipeline).
+
+        Returns
+        -------
+        torch.Tensor : [1, num_code_groups-1] int64 token ids
+        """
+        from transformers.cache_utils import DynamicCache
+
+        n = self._num_code_groups - 1
+        past_kv = DynamicCache()
+
+        # Prefill: sub_input is [1, 2, hidden]; forward infers generation_steps=0
+        out = self._code_predictor(
+            inputs_embeds=sub_input,
+            past_key_values=past_kv,
+            use_cache=True,
+        )
+        past_kv = out.past_key_values
+        token = self._pick_token(out.logits[:, -1, :], do_sample, top_k, top_p, temperature)
+        tokens = [token]
+
+        for g in range(1, n):
+            out = self._code_predictor(
+                input_ids=token,
+                past_key_values=past_kv,
+                use_cache=True,
+                generation_steps=g,
+            )
+            past_kv = out.past_key_values
+            token = self._pick_token(out.logits[:, -1, :], do_sample, top_k, top_p, temperature)
+            tokens.append(token)
+
+        return torch.cat(tokens, dim=-1)  # [1, n]
+
+    @staticmethod
+    def _pick_token(
+        logits: torch.Tensor,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Pick one token from [1, vocab] logits."""
+        if not do_sample:
+            return logits.argmax(-1, keepdim=True)  # [1, 1]
+        logits = logits / temperature
+        if top_k > 1:
+            cutoff, _ = torch.topk(logits, top_k, dim=-1)
+            logits[logits < cutoff[:, -1:]] = float("-inf")
+        if top_p < 1.0:
+            sorted_logits, sort_idx = torch.sort(logits, descending=True)
+            cum_prob = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_logits[cum_prob - torch.softmax(sorted_logits, dim=-1) > top_p] = float("-inf")
+            logits.scatter_(-1, sort_idx, sorted_logits)
+        return torch.multinomial(torch.softmax(logits, dim=-1), 1)  # [1, 1]
 
     def _decode_audio_chunk(self, codec_frames: torch.Tensor):
         """Decode codec frames to audio via the vocoder.
