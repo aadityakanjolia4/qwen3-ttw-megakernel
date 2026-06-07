@@ -63,10 +63,6 @@ class StreamingTTSMegakernel:
         self._code_predictor = self._talker.code_predictor
         self._speech_tokenizer = self._hf_model.speech_tokenizer
 
-        # Compile hot paths — reduces Python dispatch overhead per token.
-        self._backbone = torch.compile(self._backbone, mode="reduce-overhead")
-        self._code_predictor = torch.compile(self._code_predictor, mode="reduce-overhead")
-
         self._num_code_groups = self._talker_cfg.num_code_groups
 
         # Cache processor so _build_prefill_embeds doesn't reload it every call.
@@ -292,82 +288,92 @@ class StreamingTTSMegakernel:
     # ------------------------------------------------------------------
 
     def _build_prefill_embeds(self, text, speaker, language, device, dtype):
-        """Build the prefill inputs_embeds and text conditioning arrays.
+        """Build prefill inputs_embeds and trailing text conditioning.
 
-        Mirrors Qwen3TTSForConditionalGeneration.generate() prefill logic.
+        Mirrors Qwen3TTSForConditionalGeneration.generate() streaming prefill exactly:
+          role(3) + interleaved(tts_pad*N + tts_bos + codec_prefix[:-1]) + (text_tok_0 + codec_bos)
+        trailing_text_hidden = text_proj(text[4:-5]) + tts_eos_embed
         """
-        # Build text prompt in instruct format.
         text_str = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        input_obj = self._processor(text=text_str, return_tensors="pt", padding=True)
-        input_ids = input_obj["input_ids"].to(device)
+        input_ids = self._processor(text=text_str, return_tensors="pt", padding=True)[
+            "input_ids"
+        ].to(device)  # [1, T]
 
         talker = self._talker
         backbone = self._backbone
         cfg = self._hf_model.config
         tcfg = self._talker_cfg
 
-        # Text projection.
-        text_embed = talker.text_projection(
-            backbone.text_embedding(input_ids)
-        )  # [1, T, hidden]
-
-        # Speaker embedding.
-        if speaker is not None and speaker in (tcfg.spk_id or {}):
-            spk_id_val = tcfg.spk_id[speaker.lower()]
-            spk_embed = backbone.codec_embedding(
-                torch.tensor(spk_id_val, device=device, dtype=torch.long)
-            )  # [hidden] or [1, hidden]
-        else:
-            spk_embed = None
-
-        # Language token.
-        codec_language_id = (tcfg.codec_language_id or {}).get(
-            language.lower(), None
-        )
-
-        # Build codec prefix.
-        prefix_ids = []
-        if codec_language_id is not None:
-            prefix_ids.append(codec_language_id)
-        else:
-            prefix_ids.extend(
-                [tcfg.codec_nothink_id, tcfg.codec_think_bos_id, tcfg.codec_think_eos_id]
-            )
-
-        if spk_embed is not None:
-            # Speaker token is inserted before BOS.
-            prefix_ids_t = torch.tensor(prefix_ids, device=device, dtype=torch.long)
-            prefix_embed = backbone.codec_embedding(prefix_ids_t)  # [P, hidden]
-            codec_prefix_embed = torch.cat(
-                [spk_embed.unsqueeze(0), prefix_embed], dim=0
-            ).unsqueeze(0)  # [1, P+1, hidden]
-        else:
-            prefix_ids_t = torch.tensor(prefix_ids, device=device, dtype=torch.long)
-            codec_prefix_embed = backbone.codec_embedding(
-                prefix_ids_t
-            ).unsqueeze(0)  # [1, P, hidden]
-
-        # Pad embed and BOS embed.
-        special_ids = torch.tensor(
-            [cfg.tts_bos_token_id, cfg.tts_eos_token_id, cfg.tts_pad_token_id],
-            device=device,
-            dtype=torch.long,
-        )
+        # TTS special embeds (via text embedding + projection).
         tts_bos_embed, tts_eos_embed, tts_pad_embed = talker.text_projection(
-            backbone.text_embedding(special_ids.unsqueeze(0))
-        ).chunk(3, dim=1)
+            backbone.text_embedding(
+                torch.tensor(
+                    [[cfg.tts_bos_token_id, cfg.tts_eos_token_id, cfg.tts_pad_token_id]],
+                    device=device, dtype=torch.long,
+                )
+            )
+        ).chunk(3, dim=1)  # 3 × [1, 1, D]
 
-        # Concatenate: text + codec prefix + BOS.
-        # text_embed: [1, T, hidden], codec_prefix_embed: [1, P, hidden]
-        # tts_bos_embed: [1, 1, hidden]
-        prefill_embeds = torch.cat(
-            [text_embed, codec_prefix_embed, tts_bos_embed], dim=1
-        )
+        # Speaker embed (via codec embedding — same as HF model).
+        speaker_embed = None
+        if speaker is not None and speaker.lower() in (tcfg.spk_id or {}):
+            spk_id_val = tcfg.spk_id[speaker.lower()]
+            speaker_embed = talker.get_input_embeddings()(
+                torch.tensor(spk_id_val, device=device, dtype=torch.long)
+            )  # [D] or [N, D]
 
-        # Trailing text hidden (used to condition each decode step).
-        # Simple approach: repeat tts_eos_embed for each character.
-        # Full approach would align text positions, but this is a good approx.
-        trailing_text_hidden = tts_eos_embed.expand(1, input_ids.shape[1], -1)
+        # Language id.
+        codec_language_id = (tcfg.codec_language_id or {}).get(language.lower(), None)
+
+        # Codec prefix tokens (nothink path or language path).
+        if codec_language_id is None:
+            codec_prefill = [[tcfg.codec_nothink_id, tcfg.codec_think_bos_id, tcfg.codec_think_eos_id]]
+        else:
+            codec_prefill = [[getattr(tcfg, "codec_think_id", tcfg.codec_nothink_id),
+                              tcfg.codec_think_bos_id, codec_language_id, tcfg.codec_think_eos_id]]
+
+        codec_emb_0 = talker.get_input_embeddings()(
+            torch.tensor(codec_prefill, device=device, dtype=torch.long)
+        )  # [1, 3 or 4, D]
+        codec_emb_1 = talker.get_input_embeddings()(
+            torch.tensor([[tcfg.codec_pad_id, tcfg.codec_bos_id]], device=device, dtype=torch.long)
+        )  # [1, 2, D]
+
+        if speaker_embed is not None:
+            codec_input_embedding = torch.cat(
+                [codec_emb_0, speaker_embed.view(1, 1, -1), codec_emb_1], dim=1
+            )
+        else:
+            codec_input_embedding = torch.cat([codec_emb_0, codec_emb_1], dim=1)
+
+        # Role embed: first 3 tokens (<|im_start|>assistant\n).
+        role_embed = talker.text_projection(
+            backbone.text_embedding(input_ids[:, :3])
+        )  # [1, 3, D]
+
+        # Interleaved block: (tts_pad × (len-2) + tts_bos) + codec_prefix[:-1].
+        n_combined = codec_input_embedding.shape[1] - 2
+        pad_bos_block = torch.cat(
+            [tts_pad_embed.expand(-1, n_combined, -1), tts_bos_embed], dim=1
+        )  # [1, n_combined+1, D]
+        combined_block = pad_bos_block + codec_input_embedding[:, :-1]  # [1, n_combined+1, D]
+
+        # First text token fused with codec_bos.
+        first_text = talker.text_projection(
+            backbone.text_embedding(input_ids[:, 3:4])
+        )  # [1, 1, D]
+        first_combined = first_text + codec_input_embedding[:, -1:]  # [1, 1, D]
+
+        prefill_embeds = torch.cat([role_embed, combined_block, first_combined], dim=1)
+
+        # Trailing text: tokens 4..-5 projected + tts_eos appended.
+        # Guards against very short texts where 4:-5 would be empty.
+        body_ids = input_ids[:, 4:-5]
+        if body_ids.shape[1] > 0:
+            body_embed = talker.text_projection(backbone.text_embedding(body_ids))
+            trailing_text_hidden = torch.cat([body_embed, tts_eos_embed], dim=1)
+        else:
+            trailing_text_hidden = tts_eos_embed
 
         return prefill_embeds.to(dtype), trailing_text_hidden.to(dtype), tts_pad_embed.to(dtype)
 

@@ -1,8 +1,8 @@
 """JIT compilation of the megakernel CUDA extension.
 
 Two build profiles:
-  - default (Qwen3-0.6B LM):  INTERMEDIATE_SIZE=3072, NUM_KV_HEADS=8,  VOCAB=3072
-  - tts_talker (TTS talker):  INTERMEDIATE_SIZE=2048, NUM_KV_HEADS=2,  VOCAB=3072
+  - default (Qwen3-0.6B LM):         INTERMEDIATE_SIZE=3072, NUM_KV_HEADS=8, VOCAB=3072
+  - tts_talker (TTS 12Hz CustomVoice): INTERMEDIATE_SIZE=3072, NUM_KV_HEADS=8, VOCAB=3072
 """
 
 import os
