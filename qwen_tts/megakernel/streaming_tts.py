@@ -28,8 +28,15 @@ from .talker_decoder import CodePredictorKernel, TalkerDecoder
 from .talker_weights import TALKER_MAX_SEQ_LEN, load_code_predictor_weights, load_talker_weights
 
 # Vocoder decode is called every CHUNK_FRAMES codec frames.
-# At 12 Hz, 4 frames = 333 ms of audio → low latency.
-CHUNK_FRAMES = 4
+# At 12 Hz, 1 frame = 83 ms of audio → minimum TTFC.
+CHUNK_FRAMES = 1
+
+# Context frames prepended to each vocoder call to eliminate boundary artifacts.
+# The neural vocoder has a large receptive field; decoding single frames in isolation
+# causes edge transients (noise/clicks at word boundaries). Including OVERLAP_FRAMES
+# of prior context gives the model the signal it needs — those samples are trimmed
+# from the output before yielding.
+OVERLAP_FRAMES = 4
 
 
 class StreamingTTSMegakernel:
@@ -93,11 +100,39 @@ class StreamingTTSMegakernel:
         self._codec_think_eos_id = self._talker_cfg.codec_think_eos_id
         self._codec_pad_id = self._talker_cfg.codec_pad_id
 
+        device = next(self._talker.parameters()).device
+        dtype  = next(self._talker.parameters()).dtype
+
+        # Pre-compute static decode embeds (reused every synthesis call).
+        with torch.no_grad():
+            cfg_ = self._hf_model.config
+            _tts_tok = torch.tensor(
+                [[cfg_.tts_bos_token_id, cfg_.tts_eos_token_id, cfg_.tts_pad_token_id]],
+                device=device, dtype=torch.long,
+            )
+            _bos_e, _eos_e, _pad_e = self._talker.text_projection(
+                self._backbone.text_embedding(_tts_tok)
+            ).to(dtype).chunk(3, dim=1)
+            self._tts_bos_embed = _bos_e.detach()   # [1, 1, D]
+            self._tts_eos_embed = _eos_e.detach()   # [1, 1, D]
+            self._tts_pad_embed = _pad_e.detach()   # [1, 1, D]
+
+            self._codec_bos_embed = self._backbone.codec_embedding(
+                torch.tensor([[self._codec_bos_id]], device=device, dtype=torch.long)
+            ).squeeze(1).to(dtype).detach()  # [1, D]
+
+        # Warm the vocoder so the first real synthesis call pays no JIT cost.
+        # Also compute samples_per_frame for overlap-decode trimming.
+        _dummy = torch.zeros(CHUNK_FRAMES, self._num_code_groups, dtype=torch.long, device=device)
+        _warmup_audio, _ = self._decode_audio_chunk(_dummy)
+        self._samples_per_frame = len(_warmup_audio) // CHUNK_FRAMES
+        torch.cuda.synchronize()
+
         if verbose:
             print(
                 f"Megakernel TTS ready — talker {self._talker_cfg.num_hidden_layers}L "
                 f"(megakernel) + code predictor {self._talker_cfg.code_predictor_config.num_hidden_layers}L "
-                f"(megakernel)"
+                f"(megakernel) [vocoder warmed]"
             )
 
     # ------------------------------------------------------------------
@@ -147,7 +182,7 @@ class StreamingTTSMegakernel:
         dtype = next(self._talker.parameters()).dtype
 
         # ---- 1. Build prefill embeddings (same as HF model) ----------------
-        prefill_embeds, trailing_text_hidden, tts_pad_embed = (
+        prefill_embeds, trailing_text_hidden = (
             self._build_prefill_embeds(text, speaker, language, device, dtype)
         )
         torch.cuda.synchronize()
@@ -176,10 +211,7 @@ class StreamingTTSMegakernel:
         # First decode step uses the hidden state from prefill.
         # Subsequent steps use the hidden state from the megakernel.
 
-        # Compute initial embed: codec BOS + text conditioning at step 0
-        codec_bos_embed = self._backbone.codec_embedding(
-            torch.tensor([[self._codec_bos_id]], device=device, dtype=torch.long)
-        ).squeeze(1)  # [1, hidden]
+        codec_bos_embed = self._codec_bos_embed
 
         last_codec_groups = None  # Will be set after first step
 
@@ -211,7 +243,7 @@ class StreamingTTSMegakernel:
                     step_embed + trailing_text_hidden[0, generation_step]
                 )
             else:
-                step_embed = step_embed + tts_pad_embed.squeeze()
+                step_embed = step_embed + self._tts_pad_embed.squeeze()
 
             # Megakernel step: fast transformer backbone.
             _t0 = time.perf_counter()
@@ -247,13 +279,18 @@ class StreamingTTSMegakernel:
 
             # Yield audio chunk every CHUNK_FRAMES frames.
             if len(codec_frames) % CHUNK_FRAMES == 0:
+                # Include OVERLAP_FRAMES of prior context so the vocoder has
+                # signal from neighboring frames; boundary transients are eliminated.
+                ctx_start = max(0, len(codec_frames) - CHUNK_FRAMES - OVERLAP_FRAMES)
                 chunk_codes = torch.stack(
-                    codec_frames[-CHUNK_FRAMES:], dim=0
-                )  # [CHUNK_FRAMES, num_code_groups]
+                    codec_frames[ctx_start:], dim=0
+                )  # [ctx + CHUNK_FRAMES, num_code_groups]
                 _tv0 = time.perf_counter()
-                audio_chunk, sr = self._decode_audio_chunk(chunk_codes)
+                audio_with_ctx, sr = self._decode_audio_chunk(chunk_codes)
                 torch.cuda.synchronize()
                 t_vocoder_accum += time.perf_counter() - _tv0
+                ctx_frames = len(codec_frames) - CHUNK_FRAMES - ctx_start
+                audio_chunk = audio_with_ctx[ctx_frames * self._samples_per_frame:]
 
                 if not ttfc_reported:
                     ttfc_ms = (time.perf_counter() - t_start) * 1000
@@ -272,8 +309,11 @@ class StreamingTTSMegakernel:
         # Decode remaining frames (< CHUNK_FRAMES).
         remainder = len(codec_frames) % CHUNK_FRAMES
         if remainder > 0:
-            chunk_codes = torch.stack(codec_frames[-remainder:], dim=0)
-            audio_chunk, sr = self._decode_audio_chunk(chunk_codes)
+            ctx_start = max(0, len(codec_frames) - remainder - OVERLAP_FRAMES)
+            chunk_codes = torch.stack(codec_frames[ctx_start:], dim=0)
+            audio_with_ctx, sr = self._decode_audio_chunk(chunk_codes)
+            ctx_frames = len(codec_frames) - remainder - ctx_start
+            audio_chunk = audio_with_ctx[ctx_frames * self._samples_per_frame:]
             if chunk_callback is not None:
                 chunk_callback(audio_chunk, sr)
             audio_chunks.append(audio_chunk)
@@ -311,15 +351,10 @@ class StreamingTTSMegakernel:
         cfg = self._hf_model.config
         tcfg = self._talker_cfg
 
-        # TTS special embeds (via text embedding + projection).
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = talker.text_projection(
-            backbone.text_embedding(
-                torch.tensor(
-                    [[cfg.tts_bos_token_id, cfg.tts_eos_token_id, cfg.tts_pad_token_id]],
-                    device=device, dtype=torch.long,
-                )
-            )
-        ).chunk(3, dim=1)  # 3 × [1, 1, D]
+        # Use pre-computed static embeds (no GPU op needed).
+        tts_bos_embed = self._tts_bos_embed
+        tts_eos_embed = self._tts_eos_embed
+        tts_pad_embed = self._tts_pad_embed
 
         # Speaker embed (via codec embedding — same as HF model).
         speaker_embed = None
@@ -382,7 +417,7 @@ class StreamingTTSMegakernel:
         else:
             trailing_text_hidden = tts_eos_embed
 
-        return prefill_embeds.to(dtype), trailing_text_hidden.to(dtype), tts_pad_embed.to(dtype)
+        return prefill_embeds.to(dtype), trailing_text_hidden.to(dtype)
 
     def _decode_audio_chunk(self, codec_frames: torch.Tensor):
         """Decode codec frames to audio via the vocoder.
