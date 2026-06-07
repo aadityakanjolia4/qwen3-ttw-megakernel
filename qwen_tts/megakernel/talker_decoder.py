@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import torch
 
 from .talker_weights import (
+    CP_MAX_SEQ_LEN,
     TALKER_HEAD_DIM,
     TALKER_HIDDEN_SIZE,
     TALKER_INTERMEDIATE_SIZE,
@@ -236,3 +237,173 @@ class TalkerDecoder:
     @property
     def position(self) -> int:
         return self._position
+
+
+class CodePredictorKernel:
+    """Megakernel-accelerated code predictor (5-layer sub-talker).
+
+    Reuses the same compiled TTS CUDA kernel as TalkerDecoder but with
+    num_layers=5. The kernel LM-head output is discarded; per-group
+    lm_head[g] weights from HF are applied to _norm_out in Python via
+    F.linear — no HuggingFace DynamicCache overhead per frame.
+
+    Call predict() once per TTS codec frame to generate all
+    (num_code_groups - 1) sub-tokens.
+    """
+
+    def __init__(self, cp_weights: dict):
+        import torch as _torch
+        from qwen_megakernel.build import get_tts_extension
+
+        get_tts_extension()
+        self._decode_op = _torch.ops.qwen_tts_megakernel_C.decode
+
+        num_layers = cp_weights["num_layers"]
+        num_kv = cp_weights["num_kv_heads"]
+        head_dim = cp_weights["head_dim"]
+
+        self._num_layers = num_layers
+        self._attn_scale = 1.0 / math.sqrt(head_dim)
+        self._position = 0
+
+        self._embed_weight = cp_weights["dummy_embed"]
+        self._final_norm_weight = cp_weights["final_norm_weight"]
+        self._lm_head_weight = cp_weights["dummy_lm_head"]
+        self._cos_table = cp_weights["cos_table"]
+        self._sin_table = cp_weights["sin_table"]
+        self._layer_weights_packed = pack_layer_weights(cp_weights["layer_weights"], num_layers)
+
+        self._codec_embedding_weights = cp_weights["codec_embedding_weights"]
+        self._lm_head_weights = cp_weights["lm_head_weights"]
+        self._num_code_groups = cp_weights["num_code_groups"]
+        self._proj_weight = cp_weights["proj_weight"]
+        self._proj_bias = cp_weights["proj_bias"]
+
+        bf16 = dict(dtype=torch.bfloat16, device="cuda")
+        self._k_cache = torch.zeros(num_layers, num_kv, CP_MAX_SEQ_LEN, head_dim, **bf16)
+        self._v_cache = torch.zeros_like(self._k_cache)
+
+        f32 = dict(dtype=torch.float32, device="cuda")
+        q_size = TALKER_NUM_Q_HEADS * head_dim
+        kv_size = num_kv * head_dim
+
+        self._hidden = torch.empty(TALKER_HIDDEN_SIZE, **bf16)
+        self._act = torch.empty(TALKER_HIDDEN_SIZE, **f32)
+        self._res = torch.empty(TALKER_HIDDEN_SIZE, **f32)
+        self._q = torch.empty(q_size, **f32)
+        self._k = torch.empty(kv_size, **f32)
+        self._v = torch.empty(kv_size, **f32)
+        self._attn_out = torch.empty(q_size, **f32)
+        self._mlp_inter = torch.empty(TALKER_INTERMEDIATE_SIZE, **f32)
+        self._norm_out = torch.empty(TALKER_HIDDEN_SIZE, **f32)
+        self._bmax_vals = torch.empty(4096, **f32)
+        self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
+        self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
+
+    def _step(self, embed: torch.Tensor) -> None:
+        """Project (if needed), copy embed to hidden buffer, run one kernel step."""
+        e = embed.view(-1).to(torch.bfloat16)
+        if self._proj_weight is not None:
+            e = torch.nn.functional.linear(
+                e.unsqueeze(0).to(self._proj_weight.dtype),
+                self._proj_weight,
+                self._proj_bias,
+            ).view(-1).to(torch.bfloat16)
+        self._hidden.copy_(e)
+        self._decode_op(
+            self._out_token,
+            -1,  # sentinel: kernel reads from hidden_buffer instead of embed table
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            self._num_layers,
+            self._position,
+            CP_MAX_SEQ_LEN,
+            self._attn_scale,
+        )
+        self._position += 1
+
+    def predict(
+        self,
+        sub_input: torch.Tensor,
+        do_sample: bool = False,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+    ) -> torch.Tensor:
+        """Generate all sub-tokens for one codec frame.
+
+        Parameters
+        ----------
+        sub_input : [1, 2, hidden_size]
+            Row 0: talker's normalised hidden state (from mk_decoder._norm_out).
+            Row 1: backbone codec_embedding of the first codec token (group 0).
+
+        Returns
+        -------
+        torch.Tensor : [1, num_code_groups - 1] int64
+        """
+        self._position = 0
+        n = self._num_code_groups - 1  # 31 for 32-group model
+
+        # Prefill — 2 tokens; KV written at positions 0 and 1.
+        self._step(sub_input[0, 0])  # talker hidden
+        self._step(sub_input[0, 1])  # group-0 backbone codec embed
+        # _norm_out now holds RMSNorm(hidden[1]) — used for lm_head[0].
+
+        dtype = self._lm_head_weights[0].dtype
+        hidden = self._norm_out.unsqueeze(0).to(dtype)  # [1, D]
+        token = self._pick(hidden, self._lm_head_weights[0], do_sample, top_k, top_p, temperature)
+        tokens = [token]
+
+        for g in range(1, n):
+            # Embed previous token using per-group codec embedding.
+            embed = torch.nn.functional.embedding(
+                token.squeeze(-1),                        # [1]
+                self._codec_embedding_weights[g - 1],    # [vocab, D]
+            )  # [1, D]
+            self._step(embed)
+            hidden = self._norm_out.unsqueeze(0).to(self._lm_head_weights[g].dtype)
+            token = self._pick(hidden, self._lm_head_weights[g], do_sample, top_k, top_p, temperature)
+            tokens.append(token)
+
+        return torch.cat(tokens, dim=-1)  # [1, n]
+
+    @staticmethod
+    def _pick(
+        hidden: torch.Tensor,
+        lm_head_w: torch.Tensor,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+    ) -> torch.Tensor:
+        logits = torch.nn.functional.linear(hidden, lm_head_w)  # [1, vocab]
+        if not do_sample:
+            return logits.argmax(-1, keepdim=True)  # [1, 1]
+        logits = logits / temperature
+        if top_k > 1:
+            cutoff, _ = torch.topk(logits, top_k, dim=-1)
+            logits[logits < cutoff[:, -1:]] = float("-inf")
+        if top_p < 1.0:
+            sorted_logits, sort_idx = torch.sort(logits, descending=True)
+            cum_prob = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_logits[cum_prob - torch.softmax(sorted_logits, dim=-1) > top_p] = float("-inf")
+            logits.scatter_(-1, sort_idx, sorted_logits)
+        return torch.multinomial(torch.softmax(logits, dim=-1), 1)

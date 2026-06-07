@@ -24,6 +24,9 @@ TALKER_INTERMEDIATE_SIZE = 3072
 TALKER_VOCAB_SIZE = 3072
 TALKER_MAX_SEQ_LEN = 4096
 
+# Code predictor resets each frame: 2 prefill + 31 decode = 33 max positions.
+CP_MAX_SEQ_LEN = 64
+
 
 def load_talker_weights(
     model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
@@ -142,6 +145,85 @@ def load_talker_weights(
     )
 
     return weights, hf_model, talker_cfg
+
+
+def load_code_predictor_weights(hf_model) -> dict:
+    """Extract code predictor weights into megakernel format.
+
+    The 5-layer code predictor shares the same architecture as the talker
+    backbone (hidden=1024, ffn=3072, 16Q/8KV heads, head_dim=128), so the
+    same compiled TTS kernel handles it with num_layers=5.
+
+    The kernel LM-head output is ignored; per-group lm_head[g] weights are
+    applied in Python via F.linear on _norm_out.
+    """
+    cp = hf_model.talker.code_predictor
+    cp_model = cp.model
+    cp_cfg = cp.config
+
+    num_layers = cp_cfg.num_hidden_layers
+    num_kv = cp_cfg.num_key_value_heads
+    head_dim = cp_cfg.head_dim
+
+    inv_freq = cp_model.rotary_emb.inv_freq.float().cpu()
+    positions = torch.arange(CP_MAX_SEQ_LEN, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    cos_table = torch.cos(freqs).repeat(1, 2).to(torch.bfloat16).cuda().contiguous()
+    sin_table = torch.sin(freqs).repeat(1, 2).to(torch.bfloat16).cuda().contiguous()
+
+    sd = cp_model.state_dict()
+    layer_weights = []
+    for i in range(num_layers):
+        p = f"layers.{i}."
+        layer_weights.extend([
+            sd[p + "input_layernorm.weight"].contiguous(),
+            sd[p + "self_attn.q_proj.weight"].contiguous(),
+            sd[p + "self_attn.k_proj.weight"].contiguous(),
+            sd[p + "self_attn.v_proj.weight"].contiguous(),
+            sd[p + "self_attn.q_norm.weight"].contiguous(),
+            sd[p + "self_attn.k_norm.weight"].contiguous(),
+            sd[p + "self_attn.o_proj.weight"].contiguous(),
+            sd[p + "post_attention_layernorm.weight"].contiguous(),
+            sd[p + "mlp.gate_proj.weight"].contiguous(),
+            sd[p + "mlp.up_proj.weight"].contiguous(),
+            sd[p + "mlp.down_proj.weight"].contiguous(),
+        ])
+
+    final_norm_weight = sd["norm.weight"].contiguous()
+
+    # Dummy tensors for the kernel's embed lookup and LM-head — always skipped
+    # via sentinel -1, but the kernel signature still needs valid pointers.
+    dummy_embed = torch.zeros(TALKER_VOCAB_SIZE, TALKER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    dummy_lm_head = torch.zeros(TALKER_VOCAB_SIZE, TALKER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+
+    # Optional input projection (created only when cp_hidden != talker_hidden).
+    proj_weight = None
+    proj_bias = None
+    if hasattr(cp, "small_to_mtp_projection") and hasattr(cp.small_to_mtp_projection, "weight"):
+        proj_weight = cp.small_to_mtp_projection.weight.contiguous()
+        proj_bias = cp.small_to_mtp_projection.bias.contiguous()
+
+    codec_embedding_weights = [cp_model.codec_embedding[g].weight for g in range(len(cp_model.codec_embedding))]
+    lm_head_weights = [cp.lm_head[g].weight for g in range(len(cp.lm_head))]
+
+    return dict(
+        layer_weights=layer_weights,
+        final_norm_weight=final_norm_weight,
+        dummy_embed=dummy_embed,
+        dummy_lm_head=dummy_lm_head,
+        cos_table=cos_table,
+        sin_table=sin_table,
+        num_layers=num_layers,
+        num_kv_heads=num_kv,
+        head_dim=head_dim,
+        hidden_size=cp_cfg.hidden_size,
+        vocab_size=cp_cfg.vocab_size,
+        codec_embedding_weights=codec_embedding_weights,
+        lm_head_weights=lm_head_weights,
+        num_code_groups=cp_cfg.num_code_groups,
+        proj_weight=proj_weight,
+        proj_bias=proj_bias,
+    )
 
 
 def pack_layer_weights(layer_weights: list, num_layers: int) -> torch.Tensor:

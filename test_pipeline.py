@@ -41,11 +41,21 @@ def run_stt(audio_path: str, model_size: str) -> str:
     print(f"  Model : {model_size}")
     print(f"  Input : {audio_path}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute = "float16" if device == "cuda" else "int8"
+    def _load_model():
+        # int8_float16 avoids the cuBLAS dependency while still using the GPU.
+        if torch.cuda.is_available():
+            try:
+                m = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
+                print("  Device: cuda (int8_float16)")
+                return m
+            except Exception as e:
+                print(f"  CUDA load failed ({e}), falling back to CPU")
+        m = WhisperModel(model_size, device="cpu", compute_type="int8")
+        print("  Device: cpu (int8)")
+        return m
 
     t0 = time.perf_counter()
-    model = WhisperModel(model_size, device=device, compute_type=compute)
+    model = _load_model()
     load_ms = (time.perf_counter() - t0) * 1000
 
     t1 = time.perf_counter()
