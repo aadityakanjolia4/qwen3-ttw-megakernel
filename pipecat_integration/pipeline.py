@@ -133,7 +133,24 @@ def build_pipeline(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _download_whisper(model_name: str):
+    """Pre-download Whisper model files before the pipeline starts."""
+    try:
+        from faster_whisper import WhisperModel
+        print(f"[Startup] Downloading Whisper '{model_name}' ...")
+        _probe = WhisperModel(model_name, device="cpu", compute_type="int8")
+        del _probe
+        print("[Startup] Whisper downloaded.")
+    except Exception as exc:
+        print(f"[Startup] Whisper pre-download skipped: {exc}")
+
+
 async def main(args):
+    # Pre-download Whisper before building the pipeline (TTS + LLM load inside
+    # build_pipeline already, so this covers the only remaining lazy download).
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _download_whisper, args.whisper_model)
+
     pipeline, transport = build_pipeline(
         tts_model=args.tts_model,
         speaker=args.speaker,

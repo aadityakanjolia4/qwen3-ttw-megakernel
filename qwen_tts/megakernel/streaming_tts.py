@@ -185,7 +185,6 @@ class StreamingTTSMegakernel:
         prefill_embeds, trailing_text_hidden = (
             self._build_prefill_embeds(text, speaker, language, device, dtype)
         )
-        torch.cuda.synchronize()
         t_build_embeds = time.perf_counter()
 
         # ---- 2. Megakernel prefill (replaces HF backbone forward) -----------
@@ -193,7 +192,6 @@ class StreamingTTSMegakernel:
 
         self._mk_decoder.soft_reset()
         self._mk_decoder.prefill_embeds(prefill_embeds.squeeze(0))  # [T, hidden]
-        torch.cuda.synchronize()
         t_kv_inject = time.perf_counter()
 
         print(
@@ -263,7 +261,6 @@ class StreamingTTSMegakernel:
             extra_groups = self._cp_kernel.predict(
                 sub_input, do_sample, top_k, top_p, temperature
             )  # [1, num_code_groups-1]
-            torch.cuda.synchronize()
             t_decode_accum += time.perf_counter() - _t0
             all_groups = torch.cat(
                 [
@@ -287,7 +284,6 @@ class StreamingTTSMegakernel:
                 )  # [ctx + CHUNK_FRAMES, num_code_groups]
                 _tv0 = time.perf_counter()
                 audio_with_ctx, sr = self._decode_audio_chunk(chunk_codes)
-                torch.cuda.synchronize()
                 t_vocoder_accum += time.perf_counter() - _tv0
                 ctx_frames = len(codec_frames) - CHUNK_FRAMES - ctx_start
                 audio_chunk = audio_with_ctx[ctx_frames * self._samples_per_frame:]

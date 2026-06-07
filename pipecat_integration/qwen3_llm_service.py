@@ -41,30 +41,37 @@ class Qwen3LLMService:
         max_new_tokens: int = 120,
         temperature: float = 0.7,
         enable_thinking: bool = False,
+        model=None,
+        tokenizer=None,
     ):
         self._max_new_tokens = max_new_tokens
         self._temperature = temperature
         self._enable_thinking = enable_thinking
 
-        # Lazy imports so CUDA init happens only when the pipeline starts.
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        if model is not None and tokenizer is not None:
+            # Accept pre-loaded model+tokenizer (passed from server startup).
+            self._model = model
+            self._tokenizer = tokenizer
+            self._device = next(model.parameters()).device.type
+        else:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self._device = _best_device()
-        dtype = torch.float16 if self._device == "mps" else (
-            torch.bfloat16 if self._device == "cuda" else torch.float32
-        )
+            self._device = _best_device()
+            dtype = torch.float16 if self._device == "mps" else (
+                torch.bfloat16 if self._device == "cuda" else torch.float32
+            )
 
-        print(f"[Qwen3LLM] Loading {model_name} on {self._device} ({dtype}) ...")
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-        ).to(self._device)
-        self._model.eval()
+            print(f"[Qwen3LLM] Loading {model_name} on {self._device} ({dtype}) ...")
+            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self._model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+            ).to(self._device)
+            self._model.eval()
+            print("[Qwen3LLM] Ready.")
 
         # Reuse a single push frame function once wired into the pipeline.
         self._push_frame = None
-        print("[Qwen3LLM] Ready.")
 
     # ------------------------------------------------------------------
     # Pipecat FrameProcessor interface

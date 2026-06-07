@@ -68,6 +68,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         language: str = "English",
         sample_rate: int = 16000,
         verbose: bool = True,
+        tts_instance: Optional[object] = None,
     ):
         if _PIPECAT_AVAILABLE:
             super().__init__()
@@ -76,10 +77,10 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         self._language = language
         self._target_sr = sample_rate
         self._verbose = verbose
-
-        # Lazy-load to avoid GPU init at import time.
-        self._tts: Optional[object] = None
         self._model_name = model_name
+
+        # Accept a pre-loaded instance (passed from server startup) or lazy-load.
+        self._tts: Optional[object] = tts_instance
 
     def _ensure_loaded(self):
         if self._tts is None:
