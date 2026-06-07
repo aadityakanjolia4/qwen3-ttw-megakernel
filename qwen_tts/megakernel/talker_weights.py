@@ -68,9 +68,11 @@ def load_talker_weights(
 
     if verbose:
         print(f"Loading {model_name} ...")
-    hf_model = AutoModel.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map="cuda"
-    )
+    _load_kwargs = dict(dtype=torch.bfloat16, device_map="cuda")
+    try:
+        hf_model = AutoModel.from_pretrained(model_name, local_files_only=True, **_load_kwargs)
+    except EnvironmentError:
+        hf_model = AutoModel.from_pretrained(model_name, **_load_kwargs)
     hf_model.eval()
 
     talker_cfg = hf_model.config.talker_config

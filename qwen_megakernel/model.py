@@ -44,10 +44,15 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
 
     if verbose:
         print(f"Loading {model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map="cuda"
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    _load_kwargs = dict(dtype=torch.bfloat16, device_map="cuda")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, local_files_only=True, **_load_kwargs)
+    except EnvironmentError:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **_load_kwargs)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    except EnvironmentError:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
 
     # RoPE tables

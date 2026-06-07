@@ -72,7 +72,10 @@ class StreamingTTSMegakernel:
             if hasattr(self._hf_model.config, "_name_or_path")
             else model_name
         )
-        self._processor = AutoProcessor.from_pretrained(_model_id, fix_mistral_regex=True)
+        try:
+            self._processor = AutoProcessor.from_pretrained(_model_id, local_files_only=True, fix_mistral_regex=True)
+        except EnvironmentError:
+            self._processor = AutoProcessor.from_pretrained(_model_id, fix_mistral_regex=True)
 
         # Build megakernel decoder from the same weights.
         self._mk_decoder = TalkerDecoder(weights)
