@@ -73,7 +73,7 @@ class StreamingTTSMegakernel:
         )
         try:
             self._processor = AutoProcessor.from_pretrained(_model_id, local_files_only=True, fix_mistral_regex=True)
-        except EnvironmentError:
+        except (EnvironmentError, TypeError):
             self._processor = AutoProcessor.from_pretrained(_model_id, fix_mistral_regex=True)
 
         # Build megakernel decoder from the same weights.
