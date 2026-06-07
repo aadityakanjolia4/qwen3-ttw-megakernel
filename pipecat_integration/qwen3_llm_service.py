@@ -88,10 +88,10 @@ class Qwen3LLMService(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        from pipecat.frames.frames import LLMMessagesFrame
+        from pipecat.frames.frames import LLMContextFrame
 
-        if isinstance(frame, LLMMessagesFrame):
-            await self._generate(frame.messages)
+        if isinstance(frame, LLMContextFrame):
+            await self._generate(frame.context.messages)
         else:
             await self.push_frame(frame, direction)
 
@@ -239,10 +239,10 @@ class LLMUserContextAggregator(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        from pipecat.frames.frames import LLMMessagesFrame, TranscriptionFrame
+        from pipecat.frames.frames import LLMContext, LLMContextFrame, TranscriptionFrame
 
         if isinstance(frame, TranscriptionFrame):
             self._messages.append({"role": "user", "content": frame.text})
-            await self.push_frame(LLMMessagesFrame(self._messages))
+            await self.push_frame(LLMContextFrame(context=LLMContext(messages=self._messages)))
         else:
             await self.push_frame(frame, direction)
