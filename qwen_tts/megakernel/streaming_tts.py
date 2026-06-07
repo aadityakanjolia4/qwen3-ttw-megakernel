@@ -144,6 +144,8 @@ class StreamingTTSMegakernel:
         prefill_embeds, trailing_text_hidden, tts_pad_embed = (
             self._build_prefill_embeds(text, speaker, language, device, dtype)
         )
+        torch.cuda.synchronize()
+        t_build_embeds = time.perf_counter()
 
         # ---- 2. HF prefill (to get KV cache) --------------------------------
         prefill_len = prefill_embeds.shape[1]
@@ -158,12 +160,23 @@ class StreamingTTSMegakernel:
             output_hidden_states=False,
         )
         past_kv = outputs.past_key_values
+        torch.cuda.synchronize()
+        t_hf_prefill = time.perf_counter()
 
         # ---- 3. Transfer KV cache to megakernel -----------------------------
         self._mk_decoder.reset()
         self._mk_decoder.inject_kv_cache(past_kv, prefill_len)
+        torch.cuda.synchronize()
+        t_kv_inject = time.perf_counter()
 
-        t_prefill_done = time.perf_counter()
+        print(
+            f"[TTFC breakdown] build_embeds={1000*(t_build_embeds-t_start):.1f}ms "
+            f"hf_prefill={1000*(t_hf_prefill-t_build_embeds):.1f}ms "
+            f"kv_inject={1000*(t_kv_inject-t_hf_prefill):.1f}ms "
+            f"prefill_tokens={prefill_len}"
+        )
+
+        t_prefill_done = t_kv_inject
 
         # ---- 4. Bootstrap first hidden state from prefill output -------------
         # Use the last hidden state from prefill as the initial past_hidden.
@@ -185,6 +198,8 @@ class StreamingTTSMegakernel:
 
         ttfc_reported = False
         generation_step = 0
+        t_decode_accum = 0.0
+        t_vocoder_accum = 0.0
 
         for step in range(max_steps):
             # Compute inputs_embeds for this decode step.
@@ -211,6 +226,7 @@ class StreamingTTSMegakernel:
                 step_embed = step_embed + tts_pad_embed.squeeze()
 
             # Megakernel step: fast transformer backbone.
+            _t0 = time.perf_counter()
             codec_token_0, mk_hidden = self._mk_decoder.step_embed(
                 step_embed.to(torch.bfloat16)
             )
@@ -234,6 +250,8 @@ class StreamingTTSMegakernel:
                 output_hidden_states=False,
                 return_dict_in_generate=True,
             )
+            torch.cuda.synchronize()
+            t_decode_accum += time.perf_counter() - _t0
 
             # Assemble all codec groups for this frame.
             extra_groups = sub_result.sequences  # [1, num_code_groups-1]
@@ -254,11 +272,19 @@ class StreamingTTSMegakernel:
                 chunk_codes = torch.stack(
                     codec_frames[-CHUNK_FRAMES:], dim=0
                 )  # [CHUNK_FRAMES, num_code_groups]
+                _tv0 = time.perf_counter()
                 audio_chunk, sr = self._decode_audio_chunk(chunk_codes)
+                torch.cuda.synchronize()
+                t_vocoder_accum += time.perf_counter() - _tv0
 
                 if not ttfc_reported:
                     ttfc_ms = (time.perf_counter() - t_start) * 1000
-                    print(f"[Megakernel TTS] TTFC: {ttfc_ms:.1f} ms")
+                    decode_ms = t_decode_accum * 1000
+                    vocoder_ms = t_vocoder_accum * 1000
+                    print(
+                        f"[Megakernel TTS] TTFC: {ttfc_ms:.1f} ms  "
+                        f"(decode={decode_ms:.1f}ms vocoder={vocoder_ms:.1f}ms)"
+                    )
                     ttfc_reported = True
 
                 if chunk_callback is not None:
