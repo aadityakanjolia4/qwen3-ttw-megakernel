@@ -210,3 +210,31 @@ def _split_complete(text: str) -> tuple[list[str], str]:
     if len(parts) <= 1:
         return [], text
     return parts[:-1], parts[-1]
+
+
+# ---------------------------------------------------------------------------
+# User context aggregator — pipecat 1.3.0 removed LLMUserResponseAggregator
+# ---------------------------------------------------------------------------
+
+
+class LLMUserContextAggregator(FrameProcessor):
+    """Appends user transcriptions to the shared messages list and emits
+    LLMMessagesFrame so the downstream LLM service can generate a reply.
+
+    Drop-in replacement for the removed pipecat LLMUserResponseAggregator.
+    """
+
+    def __init__(self, messages: list):
+        super().__init__()
+        self._messages = messages
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        from pipecat.frames.frames import LLMMessagesFrame, TranscriptionFrame
+
+        if isinstance(frame, TranscriptionFrame):
+            self._messages.append({"role": "user", "content": frame.text})
+            await self.push_frame(LLMMessagesFrame(self._messages))
+        else:
+            await self.push_frame(frame, direction)

@@ -23,10 +23,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_response import (
-    LLMFullResponseAggregator,
-    LLMUserResponseAggregator,
-)
+from pipecat.processors.aggregators.llm_response import LLMFullResponseAggregator
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.base_transport import TransportParams
@@ -46,7 +43,7 @@ from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
 from pipecat_integration.megakernel_tts_service import MegakernelTTSService
-from pipecat_integration.qwen3_llm_service import Qwen3LLMService, SentenceSplitter
+from pipecat_integration.qwen3_llm_service import LLMUserContextAggregator, Qwen3LLMService, SentenceSplitter
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +275,7 @@ async def _run_pipeline(connection: SmallWebRTCConnection):
         }
     ]
 
-    user_agg = LLMUserResponseAggregator(messages)
+    user_agg = LLMUserContextAggregator(messages)
     assistant_agg = LLMFullResponseAggregator(messages)
 
     # Shared timing dict: observer writes vad_end_ts, TTS service reads it.
