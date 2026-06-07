@@ -107,6 +107,8 @@ class Qwen3LLMService(FrameProcessor):
         )
         from transformers import TextIteratorStreamer
 
+        original_messages = messages
+
         # /no_think disables Qwen3's chain-of-thought — essential for
         # low-latency voice responses.
         if not self._enable_thinking and messages:
@@ -151,15 +153,21 @@ class Qwen3LLMService(FrameProcessor):
         loop = asyncio.get_event_loop()
         await self.push_frame(LLMFullResponseStartFrame())
 
+        collected: list[str] = []
         while True:
             token: Optional[str] = await loop.run_in_executor(None, token_queue.get)
             if token is None:
                 break
             if token:
+                collected.append(token)
                 await self.push_frame(TextFrame(token))
 
         await self.push_frame(LLMFullResponseEndFrame())
         thread.join()
+
+        full_response = "".join(collected).strip()
+        if full_response:
+            original_messages.append({"role": "assistant", "content": full_response})
 
 
 # ---------------------------------------------------------------------------

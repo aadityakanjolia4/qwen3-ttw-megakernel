@@ -39,7 +39,6 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     UserStoppedSpeakingFrame,
 )
-from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
 from pipecat_integration.megakernel_tts_service import MegakernelTTSService
@@ -105,9 +104,7 @@ class PipelineLogger(BaseObserver):
             self._log("TTS: synthesis started")
 
         elif isinstance(frame, MetricsFrame):
-            for m in frame.data:
-                if isinstance(m, TTFBMetricsData):
-                    self._log(f"TTFB ({m.processor}): {m.value * 1000:.0f} ms")
+            pass
 
 # ---------------------------------------------------------------------------
 # Global config (set by CLI args before uvicorn starts)
@@ -276,7 +273,7 @@ async def _run_pipeline(connection: SmallWebRTCConnection):
     ]
 
     user_agg = LLMUserContextAggregator(messages)
-    assistant_agg = LLMFullResponseAggregator(messages)
+    assistant_agg = LLMFullResponseAggregator()
 
     # Shared timing dict: observer writes vad_end_ts, TTS service reads it.
     timing = {"vad_end_ts": 0.0}
