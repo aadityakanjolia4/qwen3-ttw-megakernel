@@ -36,6 +36,7 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
+  "faster-whisper",
 ]
 
 [project.optional-dependencies]

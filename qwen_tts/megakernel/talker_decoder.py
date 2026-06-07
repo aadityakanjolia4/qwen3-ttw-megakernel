@@ -51,10 +51,11 @@ class TalkerDecoder:
 
     def __init__(self, weights: dict, max_seq_len: int = TALKER_MAX_SEQ_LEN):
         # Build TTS-tuned kernel (compiled once, cached).
+        import torch as _torch
         from qwen_megakernel.build import get_tts_extension
 
-        ext = get_tts_extension()
-        self._decode_op = ext.decode
+        get_tts_extension()  # compile/load to register ops in torch.ops
+        self._decode_op = _torch.ops.qwen_tts_megakernel_C.decode
 
         self._weights = weights
         self._max_seq_len = max_seq_len
