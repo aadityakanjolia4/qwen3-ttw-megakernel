@@ -5,12 +5,12 @@ Architecture
 Prefill (HF model):
   Text tokens + speaker prompt + codec BOS → KV cache + first hidden state.
 
-Decode loop (per audio frame at 12 Hz):
+Decode loop (per audio frame):
   1. Compute inputs_embeds in Python:
        embed = sum(codec_group_embeds) + text_conditioning
-  2. Megakernel step_embed() → (codec_token_0, hidden_state)   ← fast path
-  3. Sub-talker (HF, 5 layers) generates codec_tokens_1..31  from hidden_state
-  4. Collect all 32 codec groups → audio_codes frame
+  2. Megakernel step_embed() → (codec_token_0, hidden_state)   ← talker (28L)
+  3. CodePredictorKernel.predict() → codec_tokens_1..N-1        ← kernel (5L)
+  4. Collect all N codec groups → audio_codes frame
   5. Every CHUNK_FRAMES frames, decode audio via vocoder and yield.
 
 Performance targets (RTX 5090, Qwen3-TTS-12Hz-0.6B):
@@ -24,8 +24,8 @@ from typing import Callable, Generator, Optional
 import numpy as np
 import torch
 
-from .talker_decoder import TalkerDecoder
-from .talker_weights import TALKER_MAX_SEQ_LEN, load_talker_weights
+from .talker_decoder import CodePredictorKernel, TalkerDecoder
+from .talker_weights import TALKER_MAX_SEQ_LEN, load_code_predictor_weights, load_talker_weights
 
 # Vocoder decode is called every CHUNK_FRAMES codec frames.
 # At 12 Hz, 4 frames = 333 ms of audio → low latency.
@@ -60,7 +60,6 @@ class StreamingTTSMegakernel:
 
         self._talker = self._hf_model.talker
         self._backbone = self._talker.model
-        self._code_predictor = self._talker.code_predictor
         self._speech_tokenizer = self._hf_model.speech_tokenizer
 
         self._num_code_groups = self._talker_cfg.num_code_groups
@@ -80,6 +79,12 @@ class StreamingTTSMegakernel:
         # Build megakernel decoder from the same weights.
         self._mk_decoder = TalkerDecoder(weights)
 
+        # Build megakernel code predictor (replaces HF DynamicCache loop).
+        cp_weights = load_code_predictor_weights(self._hf_model)
+        self._cp_kernel = CodePredictorKernel(cp_weights)
+        # Codec embedding tables for groups 1..N-1 (used when building next-frame input).
+        self._cp_codec_embed_weights = cp_weights["codec_embedding_weights"]
+
         # Token IDs from talker config.
         self._codec_eos_id = self._talker_cfg.codec_eos_token_id
         self._codec_bos_id = self._talker_cfg.codec_bos_id
@@ -91,7 +96,8 @@ class StreamingTTSMegakernel:
         if verbose:
             print(
                 f"Megakernel TTS ready — talker {self._talker_cfg.num_hidden_layers}L "
-                f"(megakernel) + sub-talker {self._talker_cfg.code_predictor_config.num_hidden_layers}L (HF)"
+                f"(megakernel) + code predictor {self._talker_cfg.code_predictor_config.num_hidden_layers}L "
+                f"(megakernel)"
             )
 
     # ------------------------------------------------------------------
@@ -193,8 +199,9 @@ class StreamingTTSMegakernel:
                     last_codec_groups[:1]
                 )  # group 0 embed [1, hidden]
                 for g in range(1, self._num_code_groups):
-                    emb_g = self._code_predictor.get_input_embeddings()[g - 1](
-                        last_codec_groups[g : g + 1]
+                    emb_g = torch.nn.functional.embedding(
+                        last_codec_groups[g : g + 1],
+                        self._cp_codec_embed_weights[g - 1],
                     )  # [1, hidden]
                     step_embed = step_embed + emb_g
 
@@ -215,13 +222,13 @@ class StreamingTTSMegakernel:
             if codec_token_0 == self._codec_eos_id:
                 break
 
-            # Sub-talker: generate remaining codec groups.
+            # Code predictor: generate remaining codec groups via megakernel.
             last_id_hidden = self._backbone.codec_embedding(
                 torch.tensor([[codec_token_0]], device=device, dtype=torch.long)
             )  # [1, 1, hidden]
 
             sub_input = torch.cat([mk_hidden.to(dtype), last_id_hidden], dim=1)
-            extra_groups = self._sub_talker_decode(
+            extra_groups = self._cp_kernel.predict(
                 sub_input, do_sample, top_k, top_p, temperature
             )  # [1, num_code_groups-1]
             torch.cuda.synchronize()
@@ -376,74 +383,6 @@ class StreamingTTSMegakernel:
             trailing_text_hidden = tts_eos_embed
 
         return prefill_embeds.to(dtype), trailing_text_hidden.to(dtype), tts_pad_embed.to(dtype)
-
-    def _sub_talker_decode(
-        self,
-        sub_input: torch.Tensor,
-        do_sample: bool,
-        top_k: int,
-        top_p: float,
-        temperature: float,
-    ) -> torch.Tensor:
-        """Run code_predictor autoregressively without HF generate overhead.
-
-        Each of the 31 steps uses a different lm_head[g] and codec_embedding[g-1],
-        so the loop is inherently sequential — but we bypass all of HF GenerationMixin
-        (stopping criteria, beam machinery, logits processor pipeline).
-
-        Returns
-        -------
-        torch.Tensor : [1, num_code_groups-1] int64 token ids
-        """
-        from transformers.cache_utils import DynamicCache
-
-        n = self._num_code_groups - 1
-        past_kv = DynamicCache()
-
-        # Prefill: sub_input is [1, 2, hidden]; forward infers generation_steps=0
-        out = self._code_predictor(
-            inputs_embeds=sub_input,
-            past_key_values=past_kv,
-            use_cache=True,
-        )
-        past_kv = out.past_key_values
-        token = self._pick_token(out.logits[:, -1, :], do_sample, top_k, top_p, temperature)
-        tokens = [token]
-
-        for g in range(1, n):
-            out = self._code_predictor(
-                input_ids=token,
-                past_key_values=past_kv,
-                use_cache=True,
-                generation_steps=g,
-            )
-            past_kv = out.past_key_values
-            token = self._pick_token(out.logits[:, -1, :], do_sample, top_k, top_p, temperature)
-            tokens.append(token)
-
-        return torch.cat(tokens, dim=-1)  # [1, n]
-
-    @staticmethod
-    def _pick_token(
-        logits: torch.Tensor,
-        do_sample: bool,
-        top_k: int,
-        top_p: float,
-        temperature: float,
-    ) -> torch.Tensor:
-        """Pick one token from [1, vocab] logits."""
-        if not do_sample:
-            return logits.argmax(-1, keepdim=True)  # [1, 1]
-        logits = logits / temperature
-        if top_k > 1:
-            cutoff, _ = torch.topk(logits, top_k, dim=-1)
-            logits[logits < cutoff[:, -1:]] = float("-inf")
-        if top_p < 1.0:
-            sorted_logits, sort_idx = torch.sort(logits, descending=True)
-            cum_prob = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_logits[cum_prob - torch.softmax(sorted_logits, dim=-1) > top_p] = float("-inf")
-            logits.scatter_(-1, sort_idx, sorted_logits)
-        return torch.multinomial(torch.softmax(logits, dim=-1), 1)  # [1, 1]
 
     def _decode_audio_chunk(self, codec_frames: torch.Tensor):
         """Decode codec frames to audio via the vocoder.
