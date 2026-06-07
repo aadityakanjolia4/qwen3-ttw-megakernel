@@ -170,10 +170,8 @@ async function start() {
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    setStatus('Connected — speak now');
-    btn.textContent = '⏹';
-    btn.classList.add('active');
-    btn.disabled = false;
+    ws.send(JSON.stringify({ label: 'rtvi-ai', type: 'client-ready', version: '1.0' }));
+    setStatus('Handshaking…');
   };
 
   ws.onclose = () => {
@@ -236,6 +234,14 @@ function playPcm(buffer) {
 function handleJson(raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch (_) { return; }
+
+  if (msg.label === 'rtvi-ai' && msg.type === 'bot-ready') {
+    setStatus('Connected — speak now');
+    btn.textContent = '⏹';
+    btn.classList.add('active');
+    btn.disabled = false;
+    return;
+  }
 
   if (msg.type === 'log') {
     appendLog(msg.msg);
