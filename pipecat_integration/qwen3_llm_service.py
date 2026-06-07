@@ -21,6 +21,14 @@ from typing import Optional
 import torch
 
 
+def _best_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 # ---------------------------------------------------------------------------
 # LLM service
 # ---------------------------------------------------------------------------
@@ -123,7 +131,7 @@ class Qwen3LLMService:
             tokenize=False,
             add_generation_prompt=True,
         )
-        inputs = self._tokenizer(prompt, return_tensors="pt").to("cuda")
+        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
 
         streamer = TextIteratorStreamer(
             self._tokenizer,
