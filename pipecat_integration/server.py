@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.workers.runner import WorkerRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.workers.task import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_response import LLMFullResponseAggregator
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.websocket.fastapi import (
@@ -287,7 +287,7 @@ async def _run_pipeline(websocket: WebSocket):
         ]
 
     pipeline = Pipeline(stages)
-    task = PipelineTask(
+    task = PipelineWorker(
         pipeline,
         params=PipelineParams(
             allow_interruptions=True,
@@ -296,7 +296,7 @@ async def _run_pipeline(websocket: WebSocket):
         ),
     )
     runner = WorkerRunner()
-    runner.add_workers(task)
+    await runner.add_workers(task)
 
     print("WebSocket client connected — pipeline running.")
     await runner.run()
