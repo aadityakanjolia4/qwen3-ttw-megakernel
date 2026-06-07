@@ -121,6 +121,10 @@ class StreamingTTSMegakernel:
         """
         t_start = time.perf_counter()
 
+        # Estimate max frames from word count (12 Hz, ~13 frames/word, 2s padding).
+        word_count = max(1, len(text.split()))
+        max_steps = min(self.max_new_tokens, word_count * 13 + 24)
+
         device = next(self._talker.parameters()).device
         dtype = next(self._talker.parameters()).dtype
 
@@ -170,7 +174,7 @@ class StreamingTTSMegakernel:
         ttfc_reported = False
         generation_step = 0
 
-        for step in range(self.max_new_tokens):
+        for step in range(max_steps):
             # Compute inputs_embeds for this decode step.
             if last_codec_groups is None:
                 # Very first step: use codec_bos embedding.
