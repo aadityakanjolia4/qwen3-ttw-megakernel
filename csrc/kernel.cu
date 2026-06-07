@@ -15,17 +15,34 @@
 #include <cuda_runtime.h>
 
 // =============================================================================
-// Model constants (Qwen3-0.6B)
+// Model constants — configurable via preprocessor for different architectures
+// Defaults: Qwen3-0.6B (LM). TTS talker uses different values via build flags.
 // =============================================================================
 
+#ifndef LDG_HIDDEN_SIZE
+#define LDG_HIDDEN_SIZE 1024
+#endif
+#ifndef LDG_INTERMEDIATE_SIZE
+#define LDG_INTERMEDIATE_SIZE 3072
+#endif
+#ifndef LDG_NUM_Q_HEADS
+#define LDG_NUM_Q_HEADS 16
+#endif
+#ifndef LDG_NUM_KV_HEADS
+#define LDG_NUM_KV_HEADS 8
+#endif
+#ifndef LDG_HEAD_DIM
+#define LDG_HEAD_DIM 128
+#endif
+
 constexpr int WARP_SIZE = 32;
-constexpr int HIDDEN_SIZE = 1024;
-constexpr int INTERMEDIATE_SIZE = 3072;
-constexpr int NUM_Q_HEADS = 16;
-constexpr int NUM_KV_HEADS = 8;
-constexpr int HEAD_DIM = 128;
-constexpr int Q_SIZE = NUM_Q_HEADS * HEAD_DIM;   // 2048
-constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
+constexpr int HIDDEN_SIZE = LDG_HIDDEN_SIZE;
+constexpr int INTERMEDIATE_SIZE = LDG_INTERMEDIATE_SIZE;
+constexpr int NUM_Q_HEADS = LDG_NUM_Q_HEADS;
+constexpr int NUM_KV_HEADS = LDG_NUM_KV_HEADS;
+constexpr int HEAD_DIM = LDG_HEAD_DIM;
+constexpr int Q_SIZE = NUM_Q_HEADS * HEAD_DIM;
+constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM;
 
 #ifndef LDG_NUM_BLOCKS
 #define LDG_NUM_BLOCKS 128
@@ -1240,8 +1257,10 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                       1};
 
-  // First layer reads embed row directly (no separate embed + barrier needed)
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  // When input_token_id < 0, caller pre-filled hidden_buffer with inputs_embeds.
+  const __nv_bfloat16 *embed_row = (input_token_id >= 0)
+      ? (embed_weight + input_token_id * HIDDEN_SIZE)
+      : hidden_buffer;
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
@@ -1358,7 +1377,11 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                       1};
 
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  // When input_token_id < 0, use hidden_buffer directly (caller pre-filled it
+  // with a custom inputs_embeds vector — enables TTS mixed embeddings).
+  const __nv_bfloat16 *embed_row = (input_token_id >= 0)
+      ? (embed_weight + input_token_id * HIDDEN_SIZE)
+      : hidden_buffer;
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
