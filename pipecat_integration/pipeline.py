@@ -161,7 +161,7 @@ async def main(args):
 
     task = PipelineTask(
         pipeline,
-        PipelineParams(allow_interruptions=True, enable_metrics=True),
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
     )
 
     runner = PipelineRunner()

@@ -26,8 +26,8 @@ import numpy as np
 
 # Pipecat imports — gracefully degrade if pipecat is not installed.
 try:
-    from pipecat.frames.frames import AudioRawFrame, EndFrame, Frame, TTSStartedFrame, TTSStoppedFrame
-    from pipecat.services.tts_service import TTSService
+    from pipecat.frames.frames import AudioRawFrame, EndFrame, Frame
+    from pipecat.services.tts_service import TTSService, TTSSettings
 
     _PIPECAT_AVAILABLE = True
 except ImportError:
@@ -71,7 +71,14 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         tts_instance: Optional[object] = None,
     ):
         if _PIPECAT_AVAILABLE:
-            super().__init__()
+            super().__init__(
+                sample_rate=sample_rate,
+                settings=TTSSettings(
+                    model=model_name,
+                    voice=speaker,
+                    language=language,
+                ),
+            )
 
         self._speaker = speaker
         self._language = language
@@ -81,6 +88,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
 
         # Accept a pre-loaded instance (passed from server startup) or lazy-load.
         self._tts: Optional[object] = tts_instance
+        self._last_rtf: Optional[float] = None
 
     def _ensure_loaded(self):
         if self._tts is None:
@@ -94,7 +102,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
     # Pipecat TTSService interface
     # ------------------------------------------------------------------
 
-    async def run_tts(self, sentence: str) -> AsyncGenerator:
+    async def run_tts(self, sentence: str, context_id: Optional[str] = None) -> AsyncGenerator:
         """Synthesize sentence and yield AudioRawFrame chunks as they arrive.
 
         This is called by pipecat's pipeline per TTS sentence segment.
@@ -104,22 +112,19 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
 
+        total_samples = 0
+
         def on_chunk(audio: np.ndarray, sr: int) -> None:
-            """Callback from synthesis worker → push frame to async queue."""
+            nonlocal total_samples
+            total_samples += len(audio)
             pcm = _to_pcm16(audio, src_sr=sr, dst_sr=self._target_sr)
             frame = AudioRawFrame(
                 audio=pcm.tobytes(),
                 sample_rate=self._target_sr,
                 num_channels=1,
             )
-            # Thread-safe put (synthesis runs in executor thread).
             asyncio.run_coroutine_threadsafe(queue.put(frame), loop)
 
-        if _PIPECAT_AVAILABLE:
-            yield TTSStartedFrame()
-
-        # Run blocking synthesis in a thread pool executor so we don't block
-        # the asyncio event loop.
         t0 = time.perf_counter()
         synthesis_future = loop.run_in_executor(
             None,
@@ -130,11 +135,9 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
             on_chunk,
         )
 
-        # Drain queue as chunks arrive, until synthesis is done.
         done = False
         while not done:
             try:
-                # Poll queue with short timeout.
                 frame = await asyncio.wait_for(queue.get(), timeout=0.05)
                 yield frame
             except asyncio.TimeoutError:
@@ -145,12 +148,21 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         while not queue.empty():
             yield await queue.get()
 
-        if _PIPECAT_AVAILABLE:
-            yield TTSStoppedFrame()
+        # Propagate any GPU/synthesis exception.
+        await synthesis_future
 
-        if self._verbose:
-            elapsed = (time.perf_counter() - t0) * 1000
-            print(f"[MegakernelTTSService] '{sentence[:40]}' → {elapsed:.0f} ms total")
+        elapsed = (time.perf_counter() - t0)
+        if total_samples > 0:
+            audio_duration = total_samples / self._target_sr
+            rtf = elapsed / audio_duration
+            if self._verbose:
+                print(
+                    f"[MegakernelTTSService] '{sentence[:40]}' → "
+                    f"{elapsed * 1000:.0f} ms  RTF={rtf:.3f}"
+                )
+            self._last_rtf = rtf
+        else:
+            self._last_rtf = None
 
     # ------------------------------------------------------------------
     # Standalone (non-pipecat) usage

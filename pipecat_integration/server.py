@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -28,10 +29,93 @@ from pipecat.processors.aggregators.llm_response import (
 )
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCParams, SmallWebRTCTransport
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+from pipecat.frames.frames import (
+    AudioRawFrame,
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    MetricsFrame,
+    TextFrame,
+    TranscriptionFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    UserStoppedSpeakingFrame,
+)
+from pipecat.metrics.metrics import TTFBMetricsData
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from pipecat_integration.megakernel_tts_service import MegakernelTTSService
 from pipecat_integration.qwen3_llm_service import Qwen3LLMService, SentenceSplitter
+
+
+# ---------------------------------------------------------------------------
+# Frontend logger — intercepts pipeline frames and pushes log JSON to client
+# ---------------------------------------------------------------------------
+
+class PipelineLogger(FrameProcessor):
+    """Sits at the end of the pipeline and forwards structured log events to
+    the browser via the WebRTC data channel."""
+
+    def __init__(self, connection: SmallWebRTCConnection, tts: "MegakernelTTSService | None" = None):
+        super().__init__()
+        self._conn = connection
+        self._tts = tts
+        self._vad_end_ts: float = 0.0
+        self._first_audio_sent = False
+        self._llm_buf: list[str] = []
+
+    def _log(self, msg: str):
+        self._conn.send_app_message({"type": "log", "msg": msg})
+
+    def _transcript(self, role: str, text: str):
+        self._conn.send_app_message({"type": "transcript", "role": role, "text": text})
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            self._vad_end_ts = time.perf_counter()
+            self._first_audio_sent = False
+
+        elif isinstance(frame, TranscriptionFrame):
+            self._log(f"STT: \"{frame.text}\"")
+            self._transcript("user", frame.text)
+
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            self._log("LLM: generating response")
+            self._llm_buf = []
+
+        elif isinstance(frame, TextFrame):
+            self._llm_buf.append(frame.text)
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            full = "".join(self._llm_buf).strip()
+            if full:
+                self._transcript("assistant", full)
+            self._llm_buf = []
+
+        elif isinstance(frame, TTSStartedFrame):
+            self._log("TTS: synthesis started")
+
+        elif isinstance(frame, TTSStoppedFrame):
+            if self._tts is not None and self._tts._last_rtf is not None:
+                self._log(f"RTF: {self._tts._last_rtf:.3f}")
+
+        elif isinstance(frame, AudioRawFrame) and not self._first_audio_sent:
+            self._first_audio_sent = True
+            if self._vad_end_ts:
+                ttfc_ms = (time.perf_counter() - self._vad_end_ts) * 1000
+                self._log(f"TTFC: {ttfc_ms:.0f} ms")
+
+        elif isinstance(frame, MetricsFrame):
+            for m in frame.data:
+                if isinstance(m, TTFBMetricsData):
+                    self._log(f"TTFB ({m.processor}): {m.value * 1000:.0f} ms")
+
+        await self.push_frame(frame, direction)
 
 # ---------------------------------------------------------------------------
 # Global config (set by CLI args before uvicorn starts)
@@ -137,15 +221,25 @@ STUN_SERVERS = [
     "stun:stun1.l.google.com:19302",
 ]
 
+# Registry of active connections keyed by pc_id, for renegotiation routing.
+_connections: dict[str, SmallWebRTCConnection] = {}
+
 
 @app.post("/offer")
 async def offer(request: Request):
     data = await request.json()
+    pc_id = data.get("pc_id")
 
-    connection = SmallWebRTCConnection(ice_servers=STUN_SERVERS)
-    await connection.initialize(sdp=data["sdp"], type=data["type"])
-
-    asyncio.create_task(_run_pipeline(connection))
+    if pc_id and pc_id in _connections:
+        # Renegotiation: reuse the existing connection.
+        connection = _connections[pc_id]
+        await connection.renegotiate(sdp=data["sdp"], type=data["type"])
+    else:
+        # New connection.
+        connection = SmallWebRTCConnection(ice_servers=STUN_SERVERS)
+        await connection.initialize(sdp=data["sdp"], type=data["type"])
+        _connections[connection.pc_id] = connection
+        asyncio.create_task(_run_pipeline(connection))
 
     return JSONResponse(connection.get_answer())
 
@@ -153,7 +247,7 @@ async def offer(request: Request):
 async def _run_pipeline(connection: SmallWebRTCConnection):
     transport = SmallWebRTCTransport(
         webrtc_connection=connection,
-        params=SmallWebRTCParams(
+        params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
@@ -199,25 +293,28 @@ async def _run_pipeline(connection: SmallWebRTCConnection):
             verbose=False,
             tts_instance=_loaded_tts,
         )
+        logger = PipelineLogger(connection, tts=tts)
         stages = [
             transport.input(), stt, user_agg, llm, splitter,
-            tts, transport.output(), assistant_agg,
+            tts, transport.output(), assistant_agg, logger,
         ]
     else:
         # CPU-only mode: pipeline runs without TTS (STT + LLM only).
         print("[Pipeline] Running in CPU-only mode — no TTS output.")
+        logger = PipelineLogger(connection)
         stages = [
             transport.input(), stt, user_agg, llm, splitter,
-            transport.output(), assistant_agg,
+            transport.output(), assistant_agg, logger,
         ]
 
     pipeline = Pipeline(stages)
 
-    task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True, enable_metrics=True))
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, enable_metrics=True))
     runner = PipelineRunner()
 
     print("WebRTC client connected — pipeline running.")
     await runner.run(task)
+    _connections.pop(connection.pc_id, None)
     print("WebRTC client disconnected.")
 
 

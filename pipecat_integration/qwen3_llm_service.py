@@ -20,6 +20,9 @@ from typing import Optional
 
 import torch
 
+from pipecat.frames.frames import Frame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
 
 def _best_device() -> str:
     if torch.cuda.is_available():
@@ -34,13 +37,12 @@ def _best_device() -> str:
 # ---------------------------------------------------------------------------
 
 
-class Qwen3LLMService:
+class Qwen3LLMService(FrameProcessor):
     """Wraps Qwen3-Instruct with streaming token output for Pipecat.
 
-    Implements pipecat's FrameProcessor protocol.  Listens for
-    LLMMessagesFrame, generates tokens via TextIteratorStreamer, and pushes
-    TextFrame chunks downstream.  Sentence splitting (see below) ensures TTS
-    receives whole sentences rather than sub-word fragments.
+    Listens for LLMMessagesFrame, generates tokens via TextIteratorStreamer,
+    and pushes TextFrame chunks downstream.  Sentence splitting (see below)
+    ensures TTS receives whole sentences rather than sub-word fragments.
     """
 
     def __init__(
@@ -52,6 +54,7 @@ class Qwen3LLMService:
         model=None,
         tokenizer=None,
     ):
+        super().__init__()
         self._max_new_tokens = max_new_tokens
         self._temperature = temperature
         self._enable_thinking = enable_thinking
@@ -78,32 +81,19 @@ class Qwen3LLMService:
             self._model.eval()
             print("[Qwen3LLM] Ready.")
 
-        # Reuse a single push frame function once wired into the pipeline.
-        self._push_frame = None
-
     # ------------------------------------------------------------------
     # Pipecat FrameProcessor interface
     # ------------------------------------------------------------------
 
-    async def process_frame(self, frame, direction):
-        from pipecat.frames.frames import (
-            LLMFullResponseEndFrame,
-            LLMFullResponseStartFrame,
-            LLMMessagesFrame,
-            TextFrame,
-        )
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        from pipecat.frames.frames import LLMMessagesFrame
 
         if isinstance(frame, LLMMessagesFrame):
             await self._generate(frame.messages)
         else:
             await self.push_frame(frame, direction)
-
-    async def push_frame(self, frame, direction=None):
-        if self._push_frame is not None:
-            if direction is not None:
-                await self._push_frame(frame, direction)
-            else:
-                await self._push_frame(frame)
 
     # ------------------------------------------------------------------
     # Generation
@@ -147,15 +137,13 @@ class Qwen3LLMService:
             do_sample=self._temperature > 0,
         )
 
-        # Run generate() in a background thread; pull tokens via a queue
-        # so we don't block the asyncio event loop.
         token_queue: stdlib_queue.Queue = stdlib_queue.Queue()
 
         def _run():
             try:
                 self._model.generate(**gen_kwargs)
             finally:
-                token_queue.put(None)  # sentinel
+                token_queue.put(None)
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
@@ -164,9 +152,7 @@ class Qwen3LLMService:
         await self.push_frame(LLMFullResponseStartFrame())
 
         while True:
-            token: Optional[str] = await loop.run_in_executor(
-                None, token_queue.get
-            )
+            token: Optional[str] = await loop.run_in_executor(None, token_queue.get)
             if token is None:
                 break
             if token:
@@ -183,7 +169,7 @@ class Qwen3LLMService:
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 
-class SentenceSplitter:
+class SentenceSplitter(FrameProcessor):
     """Buffers streaming TextFrames and pushes each complete sentence at once.
 
     Without this, the TTS service receives individual sub-word tokens and
@@ -193,10 +179,12 @@ class SentenceSplitter:
     """
 
     def __init__(self):
+        super().__init__()
         self._buffer = ""
-        self._push_frame = None
 
-    async def process_frame(self, frame, direction):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
         from pipecat.frames.frames import LLMFullResponseEndFrame, TextFrame
 
         if isinstance(frame, TextFrame):
@@ -207,7 +195,6 @@ class SentenceSplitter:
                 if s:
                     await self.push_frame(TextFrame(s))
         elif isinstance(frame, LLMFullResponseEndFrame):
-            # Flush whatever remains.
             tail = self._buffer.strip()
             if tail:
                 await self.push_frame(TextFrame(tail))
@@ -216,18 +203,10 @@ class SentenceSplitter:
         else:
             await self.push_frame(frame, direction)
 
-    async def push_frame(self, frame, direction=None):
-        if self._push_frame is not None:
-            if direction is not None:
-                await self._push_frame(frame, direction)
-            else:
-                await self._push_frame(frame)
-
 
 def _split_complete(text: str) -> tuple[list[str], str]:
     """Return (complete_sentences, leftover_buffer)."""
     parts = _SENTENCE_END.split(text)
     if len(parts) <= 1:
         return [], text
-    # Last element may be an incomplete sentence — keep it in the buffer.
     return parts[:-1], parts[-1]
