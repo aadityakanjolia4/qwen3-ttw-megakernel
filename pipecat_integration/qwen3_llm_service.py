@@ -107,8 +107,6 @@ class Qwen3LLMService(FrameProcessor):
         )
         from transformers import TextIteratorStreamer
 
-        original_messages = messages
-
         # /no_think disables Qwen3's chain-of-thought — essential for
         # low-latency voice responses.
         if not self._enable_thinking and messages:
@@ -153,21 +151,15 @@ class Qwen3LLMService(FrameProcessor):
         loop = asyncio.get_event_loop()
         await self.push_frame(LLMFullResponseStartFrame())
 
-        collected: list[str] = []
         while True:
             token: Optional[str] = await loop.run_in_executor(None, token_queue.get)
             if token is None:
                 break
             if token:
-                collected.append(token)
                 await self.push_frame(TextFrame(token))
 
         await self.push_frame(LLMFullResponseEndFrame())
         thread.join()
-
-        full_response = "".join(collected).strip()
-        if full_response:
-            original_messages.append({"role": "assistant", "content": full_response})
 
 
 # ---------------------------------------------------------------------------
@@ -226,15 +218,11 @@ def _split_complete(text: str) -> tuple[list[str], str]:
 
 
 class LLMUserContextAggregator(FrameProcessor):
-    """Appends user transcriptions to the shared messages list and emits
-    LLMMessagesFrame so the downstream LLM service can generate a reply.
-
-    Drop-in replacement for the removed pipecat LLMUserResponseAggregator.
-    """
+    """Sends system prompt + current user turn only (no history) for low latency."""
 
     def __init__(self, messages: list):
         super().__init__()
-        self._messages = messages
+        self._system_messages = [m for m in messages if m.get("role") == "system"]
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -242,7 +230,7 @@ class LLMUserContextAggregator(FrameProcessor):
         from pipecat.frames.frames import LLMContext, LLMContextFrame, TranscriptionFrame
 
         if isinstance(frame, TranscriptionFrame):
-            self._messages.append({"role": "user", "content": frame.text})
-            await self.push_frame(LLMContextFrame(context=LLMContext(messages=self._messages)))
+            msgs = self._system_messages + [{"role": "user", "content": frame.text}]
+            await self.push_frame(LLMContextFrame(context=LLMContext(messages=msgs)))
         else:
             await self.push_frame(frame, direction)
