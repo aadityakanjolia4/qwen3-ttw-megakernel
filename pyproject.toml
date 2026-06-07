@@ -36,6 +36,14 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
+  "faster-whisper",
+]
+
+[project.optional-dependencies]
+# Local mic/speaker transport
+local = [
+  "pipecat-ai[silero,audio]",
+  "faster-whisper",
 ]
 
 [project.urls]
@@ -45,7 +53,7 @@ Repository = "https://github.com/synciq-ai/qwen3-tts-megakernel"
 qwen-tts-demo = "qwen_tts.cli.demo:main"
 
 [tool.setuptools]
-packages = { find = { where = ["."], include = ["qwen_megakernel*", "qwen_tts*"] } }
+packages = { find = { where = ["."], include = ["qwen_megakernel*", "qwen_tts*", "pipecat_integration*"] } }
 include-package-data = true
 
 [tool.setuptools.package-data]
