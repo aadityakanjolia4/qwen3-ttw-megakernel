@@ -68,7 +68,7 @@ class StreamingTTSMegakernel:
         from transformers import AutoProcessor
         _model_id = (
             self._hf_model.config._name_or_path
-            if hasattr(self._hf_model.config, "_name_or_path")
+            if hasattr(self._hf_model.config, "_name_or_path") and self._hf_model.config._name_or_path
             else model_name
         )
         try:
