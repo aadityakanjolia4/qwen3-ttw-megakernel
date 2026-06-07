@@ -213,6 +213,26 @@ class TalkerDecoder:
         self._k_cache.zero_()
         self._v_cache.zero_()
 
+    def soft_reset(self) -> None:
+        """Reset position only — KV values are overwritten by prefill_embeds."""
+        self._position = 0
+
+    def prefill_embeds(self, embeds: torch.Tensor) -> None:
+        """Fill the KV cache for the prefill sequence using the megakernel.
+
+        Runs the decode kernel once per token at positions 0..T-1.
+        Replaces the HF backbone forward pass + inject_kv_cache.
+
+        Parameters
+        ----------
+        embeds : [T, hidden_size] bfloat16 on CUDA
+        """
+        seq = embeds.view(-1, TALKER_HIDDEN_SIZE).to(torch.bfloat16)
+        T = seq.shape[0]
+        for t in range(T):
+            self._hidden.copy_(seq[t])
+            self._call_kernel(-1)
+
     @property
     def position(self) -> int:
         return self._position

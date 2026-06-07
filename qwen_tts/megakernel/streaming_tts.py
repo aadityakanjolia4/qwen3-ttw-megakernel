@@ -147,42 +147,23 @@ class StreamingTTSMegakernel:
         torch.cuda.synchronize()
         t_build_embeds = time.perf_counter()
 
-        # ---- 2. HF prefill (to get KV cache) --------------------------------
+        # ---- 2. Megakernel prefill (replaces HF backbone forward) -----------
         prefill_len = prefill_embeds.shape[1]
 
-        from transformers.cache_utils import DynamicCache
-
-        past_kv = DynamicCache()
-        outputs = self._backbone(
-            inputs_embeds=prefill_embeds,
-            past_key_values=past_kv,
-            use_cache=True,
-            output_hidden_states=False,
-        )
-        past_kv = outputs.past_key_values
-        torch.cuda.synchronize()
-        t_hf_prefill = time.perf_counter()
-
-        # ---- 3. Transfer KV cache to megakernel -----------------------------
-        self._mk_decoder.reset()
-        self._mk_decoder.inject_kv_cache(past_kv, prefill_len)
+        self._mk_decoder.soft_reset()
+        self._mk_decoder.prefill_embeds(prefill_embeds.squeeze(0))  # [T, hidden]
         torch.cuda.synchronize()
         t_kv_inject = time.perf_counter()
 
         print(
             f"[TTFC breakdown] build_embeds={1000*(t_build_embeds-t_start):.1f}ms "
-            f"hf_prefill={1000*(t_hf_prefill-t_build_embeds):.1f}ms "
-            f"kv_inject={1000*(t_kv_inject-t_hf_prefill):.1f}ms "
+            f"mk_prefill={1000*(t_kv_inject-t_build_embeds):.1f}ms "
             f"prefill_tokens={prefill_len}"
         )
 
         t_prefill_done = t_kv_inject
 
-        # ---- 4. Bootstrap first hidden state from prefill output -------------
-        # Use the last hidden state from prefill as the initial past_hidden.
-        prefill_hidden = outputs.last_hidden_state[:, -1:, :]  # [1, 1, hidden]
-
-        # ---- 5. Decode loop --------------------------------------------------
+        # ---- 3. Decode loop --------------------------------------------------
         codec_frames = []  # list of [num_code_groups] tensors
         audio_chunks = []
 
