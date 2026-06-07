@@ -227,7 +227,8 @@ class LLMUserContextAggregator(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        from pipecat.frames.frames import LLMContext, LLMContextFrame, TranscriptionFrame
+        from pipecat.frames.frames import LLMContextFrame, TranscriptionFrame
+        from pipecat.processors.aggregators.llm_context import LLMContext
 
         if isinstance(frame, TranscriptionFrame):
             msgs = self._system_messages + [{"role": "user", "content": frame.text}]
