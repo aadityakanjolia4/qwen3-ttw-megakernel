@@ -86,10 +86,10 @@ KERNEL_FLAGS = _build_flags(
 
 CUDA_FLAGS = _CUDA_BASE_FLAGS + KERNEL_FLAGS
 
-# TTS talker profile: smaller intermediate, fewer KV heads (matches Qwen3-TTS-0.6B talker).
+# TTS talker profile (Qwen3-TTS-12Hz-0.6B-CustomVoice): 28L, ffn=3072, KV=8 heads.
 TTS_KERNEL_FLAGS = _build_flags(
-    intermediate_size=_env_int("LDG_TTS_INTERMEDIATE_SIZE", 2048),
-    num_kv_heads=_env_int("LDG_TTS_NUM_KV_HEADS", 2),
+    intermediate_size=_env_int("LDG_TTS_INTERMEDIATE_SIZE", 3072),
+    num_kv_heads=_env_int("LDG_TTS_NUM_KV_HEADS", 8),
     vocab_size=3072,
     num_blocks=_env_int("LDG_NUM_BLOCKS", 128),
     block_size=_env_int("LDG_BLOCK_SIZE", 512),

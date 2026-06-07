@@ -63,7 +63,20 @@ class StreamingTTSMegakernel:
         self._code_predictor = self._talker.code_predictor
         self._speech_tokenizer = self._hf_model.speech_tokenizer
 
+        # Compile hot paths — reduces Python dispatch overhead per token.
+        self._backbone = torch.compile(self._backbone, mode="reduce-overhead")
+        self._code_predictor = torch.compile(self._code_predictor, mode="reduce-overhead")
+
         self._num_code_groups = self._talker_cfg.num_code_groups
+
+        # Cache processor so _build_prefill_embeds doesn't reload it every call.
+        from transformers import AutoProcessor
+        _model_id = (
+            self._hf_model.config._name_or_path
+            if hasattr(self._hf_model.config, "_name_or_path")
+            else model_name
+        )
+        self._processor = AutoProcessor.from_pretrained(_model_id, fix_mistral_regex=True)
 
         # Build megakernel decoder from the same weights.
         self._mk_decoder = TalkerDecoder(weights)
@@ -283,18 +296,9 @@ class StreamingTTSMegakernel:
 
         Mirrors Qwen3TTSForConditionalGeneration.generate() prefill logic.
         """
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(
-            self._hf_model.config._name_or_path
-            if hasattr(self._hf_model.config, "_name_or_path")
-            else "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            fix_mistral_regex=True,
-        )
-
         # Build text prompt in instruct format.
         text_str = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        input_obj = processor(text=text_str, return_tensors="pt", padding=True)
+        input_obj = self._processor(text=text_str, return_tensors="pt", padding=True)
         input_ids = input_obj["input_ids"].to(device)
 
         talker = self._talker
