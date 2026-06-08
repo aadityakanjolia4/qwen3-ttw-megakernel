@@ -260,9 +260,9 @@ async def _run_pipeline(websocket: WebSocket):
         {
             "role": "system",
             "content": (
-                "You are a helpful voice assistant. "
-                "Reply in two sentences maximum. "
-                "Never use bullet points, lists, or markdown."
+                "You are a helpful voice assistant speaking on a phone call. "
+                "Keep every reply to one or two short sentences. "
+                "Speak naturally — no bullet points, no lists, no markdown, no XML tags, no code."
             ),
         }
     ]

@@ -151,11 +151,35 @@ class Qwen3LLMService(FrameProcessor):
                 self._model.generate(**gen_kwargs)
 
         def _run_read():
+            in_think = False
+            buf = ""
             try:
                 for text in streamer:
-                    if text:
-                        token_queue.put(text)
+                    if not text:
+                        continue
+                    buf += text
+                    # Strip <think>...</think> blocks that Qwen3 leaks even with /no_think
+                    while True:
+                        if in_think:
+                            end = buf.find("</think>")
+                            if end == -1:
+                                buf = ""  # discard mid-think content
+                                break
+                            buf = buf[end + len("</think>"):]
+                            in_think = False
+                        else:
+                            start = buf.find("<think>")
+                            if start == -1:
+                                token_queue.put(buf)
+                                buf = ""
+                                break
+                            if start > 0:
+                                token_queue.put(buf[:start])
+                            buf = buf[start + len("<think>"):]
+                            in_think = True
             finally:
+                if buf and not in_think:
+                    token_queue.put(buf)
                 token_queue.put(None)
 
         gen_thread = threading.Thread(target=_run_gen, daemon=True)
