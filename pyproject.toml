@@ -37,6 +37,10 @@ dependencies = [
   "onnxruntime",
   "einops",
   "faster-whisper",
+  # WebRTC server
+  "pipecat-ai[silero,webrtc]",
+  "fastapi",
+  "uvicorn[standard]",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +55,7 @@ webrtc = [
   "fastapi",
   "uvicorn[standard]",
   "faster-whisper",
+  "numpy",
 ]
 
 [project.urls]
