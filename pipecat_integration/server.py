@@ -87,6 +87,7 @@ class PipelineLogger(BaseObserver):
         self._ws = websocket
         self._timing = timing
         self._llm_buf: list[str] = []
+        self._llm_start_ts: float = 0.0
         self._seen_ids: set[int] = set()
 
     def _log(self, msg: str):
@@ -116,12 +117,17 @@ class PipelineLogger(BaseObserver):
             self._log(f"STT: \"{frame.text}\"")
             self._transcript("user", frame.text)
         elif isinstance(frame, LLMFullResponseStartFrame):
-            self._log("LLM: generating")
             self._llm_buf = []
+            self._llm_start_ts = time.perf_counter()
         elif isinstance(frame, TextFrame):
             self._llm_buf.append(frame.text)
         elif isinstance(frame, LLMFullResponseEndFrame):
             full = "".join(self._llm_buf).strip()
+            elapsed = time.perf_counter() - self._llm_start_ts
+            # Qwen3 BPE: ~4 chars/token is a reliable approximation for English
+            approx_tokens = max(1, len(full) // 4)
+            tps = approx_tokens / elapsed if elapsed > 0 else 0
+            self._log(f"LLM: {approx_tokens} tok  {tps:.0f} tok/s  ({elapsed*1000:.0f} ms)")
             if full:
                 self._transcript("assistant", full)
             self._llm_buf = []
