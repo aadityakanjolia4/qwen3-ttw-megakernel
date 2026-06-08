@@ -53,11 +53,13 @@ class Qwen3LLMService(FrameProcessor):
         enable_thinking: bool = False,
         model=None,
         tokenizer=None,
+        system_messages: list = None,
     ):
         super().__init__()
         self._max_new_tokens = max_new_tokens
         self._temperature = temperature
         self._enable_thinking = enable_thinking
+        self._system_messages = [m for m in (system_messages or []) if m.get("role") == "system"]
 
         if model is not None and tokenizer is not None:
             # Accept pre-loaded model+tokenizer (passed from server startup).
@@ -88,13 +90,12 @@ class Qwen3LLMService(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        from pipecat.frames.frames import LLMContextFrame
+        from pipecat.frames.frames import TranscriptionFrame
 
-        print(f"[LLM] received frame: {type(frame).__name__}", flush=True)
-
-        if isinstance(frame, LLMContextFrame):
-            print(f"[LLM] LLMContextFrame received — starting generation", flush=True)
-            await self._generate(frame.context.messages)
+        if isinstance(frame, TranscriptionFrame):
+            print(f"[LLM] TranscriptionFrame: {frame.text!r}", flush=True)
+            msgs = self._system_messages + [{"role": "user", "content": frame.text}]
+            await self._generate(msgs)
         else:
             await self.push_frame(frame, direction)
 
@@ -103,7 +104,7 @@ class Qwen3LLMService(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def _generate(self, messages: list):
-        print(f"[LLM] _generate called with {len(messages)} messages", flush=True)
+        print(f"[LLM] generating for {len(messages)} messages", flush=True)
         from pipecat.frames.frames import (
             LLMFullResponseEndFrame,
             LLMFullResponseStartFrame,
@@ -234,13 +235,8 @@ class LLMUserContextAggregator(FrameProcessor):
         from pipecat.frames.frames import LLMContextFrame, TranscriptionFrame
         from pipecat.processors.aggregators.llm_context import LLMContext
 
-        print(f"[UserAgg] received frame: {type(frame).__name__}", flush=True)
-
         if isinstance(frame, TranscriptionFrame):
-            print(f"[UserAgg] TranscriptionFrame text={frame.text!r}", flush=True)
             msgs = self._system_messages + [{"role": "user", "content": frame.text}]
-            ctx_frame = LLMContextFrame(context=LLMContext(messages=msgs))
-            print(f"[UserAgg] pushing LLMContextFrame with {len(msgs)} messages", flush=True)
-            await self.push_frame(ctx_frame)
+            await self.push_frame(LLMContextFrame(context=LLMContext(messages=msgs)))
         else:
             await self.push_frame(frame, direction)

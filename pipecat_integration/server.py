@@ -36,14 +36,13 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_response import LLMFullResponseAggregator
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 from pipecat_integration.megakernel_tts_service import MegakernelTTSService
-from pipecat_integration.qwen3_llm_service import LLMUserContextAggregator, Qwen3LLMService, SentenceSplitter
+from pipecat_integration.qwen3_llm_service import Qwen3LLMService, SentenceSplitter
 
 
 # ---------------------------------------------------------------------------
@@ -257,17 +256,7 @@ async def _run_pipeline(websocket: WebSocket):
 
     stt = WhisperSTTService(settings=WhisperSTTService.Settings(model=_cfg["whisper_model"]))
 
-    llm = Qwen3LLMService(
-        max_new_tokens=120,
-        temperature=0.7,
-        enable_thinking=False,
-        model=_loaded_llm_model,
-        tokenizer=_loaded_llm_tokenizer,
-    )
-
-    splitter = SentenceSplitter()
-
-    messages = [
+    system_messages = [
         {
             "role": "system",
             "content": (
@@ -278,8 +267,16 @@ async def _run_pipeline(websocket: WebSocket):
         }
     ]
 
-    user_agg = LLMUserContextAggregator(messages)
-    assistant_agg = LLMFullResponseAggregator()
+    llm = Qwen3LLMService(
+        max_new_tokens=120,
+        temperature=0.7,
+        enable_thinking=False,
+        model=_loaded_llm_model,
+        tokenizer=_loaded_llm_tokenizer,
+        system_messages=system_messages,
+    )
+
+    splitter = SentenceSplitter()
 
     timing = {"vad_end_ts": 0.0}
     obs = PipelineLogger(websocket, timing)
@@ -294,14 +291,14 @@ async def _run_pipeline(websocket: WebSocket):
             timing=timing,
         )
         stages = [
-            transport.input(), vad, stt, user_agg, llm, splitter,
-            tts, transport.output(), assistant_agg,
+            transport.input(), vad, stt, llm, splitter,
+            tts, transport.output(),
         ]
     else:
         print("[Pipeline] CPU-only mode — no TTS.")
         stages = [
-            transport.input(), vad, stt, user_agg, llm, splitter,
-            transport.output(), assistant_agg,
+            transport.input(), vad, stt, llm, splitter,
+            transport.output(),
         ]
 
     pipeline = Pipeline(stages)
