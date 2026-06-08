@@ -1,65 +1,106 @@
-"""FastAPI server — WebRTC signaling + pipeline runner.
+"""FastAPI server — WebSocket transport + pipeline runner.
 
 Run on Vast.ai:
   pip install -e ".[webrtc]"
   python -m pipecat_integration.server --port 8080
 
 Then open  http://<vast-ip>:8080  in your browser.
+Works through ngrok / SSH TCP tunnels (WebSocket, no UDP required).
 """
 
 import argparse
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import (
+    Frame,
+    InputAudioRawFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    MetricsFrame,
+    OutputAudioRawFrame,
+    TextFrame,
+    TranscriptionFrame,
+    TTSStartedFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_response import LLMFullResponseAggregator
+from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.whisper.stt import WhisperSTTService
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-
-from pipecat.frames.frames import (
-    Frame,
-    LLMFullResponseEndFrame,
-    LLMFullResponseStartFrame,
-    MetricsFrame,
-    TextFrame,
-    TranscriptionFrame,
-    TTSStartedFrame,
-    UserStoppedSpeakingFrame,
-)
-from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 from pipecat_integration.megakernel_tts_service import MegakernelTTSService
 from pipecat_integration.qwen3_llm_service import LLMUserContextAggregator, Qwen3LLMService, SentenceSplitter
 
 
 # ---------------------------------------------------------------------------
-# Pipeline observer
+# Custom binary PCM serializer
+# ---------------------------------------------------------------------------
+
+class PCMSerializer(FrameSerializer):
+    """Binary PCM ↔ pipecat frames.
+
+    Browser → Server: raw little-endian 16-bit PCM at 16 kHz mono
+    Server → Browser: raw little-endian 16-bit PCM at 16 kHz mono
+    Text messages (JSON): forwarded as-is for control / log / transcript
+    """
+
+    def __init__(self, sample_rate: int = 16000, num_channels: int = 1):
+        super().__init__()
+        self._sample_rate = sample_rate
+        self._num_channels = num_channels
+
+    async def serialize(self, frame: Frame) -> str | bytes | None:
+        if isinstance(frame, OutputAudioRawFrame):
+            return frame.audio
+        return None
+
+    async def deserialize(self, data: str | bytes) -> Frame | None:
+        if isinstance(data, bytes) and data:
+            return InputAudioRawFrame(
+                audio=data,
+                sample_rate=self._sample_rate,
+                num_channels=self._num_channels,
+            )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline observer — sends log/transcript JSON to the browser
 # ---------------------------------------------------------------------------
 
 class PipelineLogger(BaseObserver):
-    def __init__(self, connection: SmallWebRTCConnection, timing: dict):
+    def __init__(self, websocket: WebSocket, timing: dict):
         super().__init__()
-        self._conn = connection
+        self._ws = websocket
         self._timing = timing
         self._llm_buf: list[str] = []
         self._seen_ids: set[int] = set()
 
     def _log(self, msg: str):
-        self._conn.send_app_message({"type": "log", "msg": msg})
+        asyncio.create_task(self._send({"type": "log", "msg": msg}))
 
     def _transcript(self, role: str, text: str):
-        self._conn.send_app_message({"type": "transcript", "role": role, "text": text})
+        asyncio.create_task(self._send({"type": "transcript", "role": role, "text": text}))
+
+    async def _send(self, obj: dict):
+        try:
+            await self._ws.send_text(json.dumps(obj))
+        except Exception:
+            pass
 
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
@@ -70,7 +111,7 @@ class PipelineLogger(BaseObserver):
         if len(self._seen_ids) > 2000:
             self._seen_ids.clear()
 
-        if isinstance(frame, UserStoppedSpeakingFrame):
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._timing["vad_end_ts"] = time.perf_counter()
         elif isinstance(frame, TranscriptionFrame):
             self._log(f"STT: \"{frame.text}\"")
@@ -177,44 +218,42 @@ async def index():
     return CLIENT_HTML.read_text()
 
 
-STUN_SERVERS = [
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-]
-
-_connections: dict[str, SmallWebRTCConnection] = {}
-
-
-@app.post("/offer")
-async def offer(request: Request):
-    data = await request.json()
-    pc_id = data.get("pc_id")
-
-    if pc_id and pc_id in _connections:
-        connection = _connections[pc_id]
-        await connection.renegotiate(sdp=data["sdp"], type=data["type"])
-    else:
-        connection = SmallWebRTCConnection(ice_servers=STUN_SERVERS)
-        await connection.initialize(sdp=data["sdp"], type=data["type"])
-        _connections[connection.pc_id] = connection
-        asyncio.create_task(_run_pipeline(connection))
-
-    return JSONResponse(connection.get_answer())
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("WebSocket client connected — starting pipeline.")
+    try:
+        await _run_pipeline(websocket)
+    except Exception as exc:
+        print(f"[Pipeline] Error: {exc}")
+    print("WebSocket client disconnected.")
 
 
-async def _run_pipeline(connection: SmallWebRTCConnection):
-    transport = SmallWebRTCTransport(
-        webrtc_connection=connection,
-        params=TransportParams(
+# ---------------------------------------------------------------------------
+# Pipeline factory
+# ---------------------------------------------------------------------------
+
+def _make_log_cb(ws: WebSocket):
+    def cb(msg: dict):
+        asyncio.create_task(ws.send_text(json.dumps(msg)))
+    return cb
+
+
+async def _run_pipeline(websocket: WebSocket):
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=16000,
+            serializer=PCMSerializer(sample_rate=16000),
         ),
     )
 
     sample_rate = 16000
+
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
 
     stt = WhisperSTTService(settings=WhisperSTTService.Settings(model=_cfg["whisper_model"]))
 
@@ -243,7 +282,7 @@ async def _run_pipeline(connection: SmallWebRTCConnection):
     assistant_agg = LLMFullResponseAggregator()
 
     timing = {"vad_end_ts": 0.0}
-    obs = PipelineLogger(connection, timing)
+    obs = PipelineLogger(websocket, timing)
 
     if _loaded_tts is not None:
         tts = MegakernelTTSService(
@@ -251,17 +290,17 @@ async def _run_pipeline(connection: SmallWebRTCConnection):
             sample_rate=sample_rate,
             verbose=False,
             tts_instance=_loaded_tts,
-            connection=connection,
+            log_callback=_make_log_cb(websocket),
             timing=timing,
         )
         stages = [
-            transport.input(), stt, user_agg, llm, splitter,
+            transport.input(), vad, stt, user_agg, llm, splitter,
             tts, transport.output(), assistant_agg,
         ]
     else:
         print("[Pipeline] CPU-only mode — no TTS.")
         stages = [
-            transport.input(), stt, user_agg, llm, splitter,
+            transport.input(), vad, stt, user_agg, llm, splitter,
             transport.output(), assistant_agg,
         ]
 
@@ -271,15 +310,13 @@ async def _run_pipeline(connection: SmallWebRTCConnection):
         params=PipelineParams(
             allow_interruptions=True,
             enable_metrics=True,
-            observers=[obs],
         ),
+        enable_rtvi=False,
+        observers=[obs],
     )
-    runner = PipelineRunner()
+    runner = PipelineRunner(handle_sigint=False)
 
-    print("WebRTC client connected — pipeline running.")
     await runner.run(task)
-    _connections.pop(connection.pc_id, None)
-    print("WebRTC client disconnected.")
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +339,7 @@ if __name__ == "__main__":
     )
 
     print(
-        f"\nStarting WebRTC server\n"
+        f"\nStarting WebSocket server\n"
         f"  STT : Faster-Whisper {args.whisper_model}\n"
         f"  LLM : Qwen3-0.6B\n"
         f"  TTS : {args.tts_model}\n\n"

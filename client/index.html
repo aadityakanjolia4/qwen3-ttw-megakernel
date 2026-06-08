@@ -82,34 +82,43 @@
   <div id="status">Click to start</div>
   <div id="transcript"></div>
   <div id="log"></div>
-  <audio id="audio" autoplay></audio>
 
 <script>
 const btn          = document.getElementById('btn');
 const status       = document.getElementById('status');
-const audio        = document.getElementById('audio');
 const logEl        = document.getElementById('log');
 const transcriptEl = document.getElementById('transcript');
 
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-];
+// WebSocket URL — same host, /ws path
+const WS_URL = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 
-let pc        = null;
-let dc        = null;
-let pcId      = null;
-let pingTimer = null;
+// AudioWorklet processor source (inline blob)
+const WORKLET_SRC = `
+class PCMCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) this.port.postMessage(ch.slice());
+    return true;
+  }
+}
+registerProcessor('pcm-capture', PCMCaptureProcessor);
+`;
+
+let ws         = null;
+let audioCtx   = null;
+let micSource  = null;
+let worklet    = null;
+let stream     = null;
+let nextTime   = 0;   // scheduled playback cursor (AudioContext time)
 
 btn.addEventListener('click', () => {
-  if (pc) stop(); else start();
+  if (ws) stop(); else start();
 });
 
 async function start() {
   btn.disabled = true;
   setStatus('Requesting microphone…');
 
-  let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (e) {
@@ -118,106 +127,94 @@ async function start() {
     return;
   }
 
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  // AudioContext at 16 kHz so the browser resamples mic audio for us
+  audioCtx = new AudioContext({ sampleRate: 16000 });
 
-  pc.addTransceiver(stream.getAudioTracks()[0], { direction: 'sendrecv' });
-  pc.addTransceiver('video', { direction: 'recvonly' });
-
-  dc = pc.createDataChannel('pipecat');
-
-  dc.addEventListener('open', () => {
-    pingTimer = setInterval(() => {
-      if (dc.readyState === 'open') dc.send('ping');
-    }, 2000);
-  });
-
-  dc.addEventListener('message', (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg?.type === 'signalling' && msg?.message?.type === 'renegotiate') {
-        renegotiate();
-      } else if (msg?.type === 'log') {
-        appendLog(msg.msg);
-      } else if (msg?.type === 'transcript') {
-        appendTranscript(msg.role, msg.text);
-      }
-    } catch (_) {}
-  });
-
-  pc.addEventListener('track', (e) => {
-    if (e.track.kind === 'audio') {
-      audio.srcObject = new MediaStream([e.track]);
-    }
-  });
-
-  pc.addEventListener('connectionstatechange', () => {
-    const s = pc.connectionState;
-    setStatus(s.charAt(0).toUpperCase() + s.slice(1));
-    if (s === 'failed' || s === 'closed') cleanup();
-  });
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
   setStatus('Connecting…');
-  await waitForIceGathering(pc);
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
 
-  let resp;
-  try {
-    resp = await fetch('/offer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-    });
-  } catch (e) {
-    setStatus('Server unreachable: ' + e.message);
-    cleanup();
-    return;
-  }
+  ws.onopen  = onOpen;
+  ws.onmessage = onMessage;
+  ws.onerror = (e) => { setStatus('WebSocket error'); cleanup(); };
+  ws.onclose = () => cleanup();
+}
 
-  if (!resp.ok) { setStatus('Server error ' + resp.status); cleanup(); return; }
-
-  const answer = await resp.json();
-  pcId = answer.pc_id;
-  await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
-
+async function onOpen() {
+  setStatus('Connected — speak now');
   btn.textContent = '⏹';
   btn.classList.add('active');
   btn.disabled = false;
-  setStatus('Connected — speak now');
+
+  // Register AudioWorklet and start capturing mic → binary PCM → WebSocket
+  const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+  const url  = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  worklet = new AudioWorkletNode(audioCtx, 'pcm-capture');
+  worklet.port.onmessage = (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Float32 → Int16 little-endian
+    const f32 = e.data;
+    const buf = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      buf[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+    }
+    ws.send(buf.buffer);
+  };
+
+  micSource = audioCtx.createMediaStreamSource(stream);
+  micSource.connect(worklet);
+  // Do NOT connect worklet to destination — we don't want mic echo
 }
 
-async function renegotiate() {
-  if (!pc) return;
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await waitForIceGathering(pc);
+function onMessage(e) {
+  if (e.data instanceof ArrayBuffer) {
+    // Binary = PCM audio from TTS
+    playPCM(e.data);
+  } else {
+    // Text = JSON control (log, transcript)
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'log')        appendLog(msg.msg);
+      if (msg.type === 'transcript') appendTranscript(msg.role, msg.text);
+    } catch (_) {}
+  }
+}
 
-  const resp = await fetch('/offer', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sdp: pc.localDescription.sdp,
-      type: pc.localDescription.type,
-      pc_id: pcId,
-    }),
-  });
-  if (!resp.ok) return;
-  const answer = await resp.json();
-  await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+function playPCM(arrayBuffer) {
+  // Raw 16-bit PCM @ 16 kHz mono
+  const i16   = new Int16Array(arrayBuffer);
+  const f32   = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+
+  const buf = audioCtx.createBuffer(1, f32.length, 16000);
+  buf.copyToChannel(f32, 0);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+
+  // Schedule gaplessly: always start at nextTime (or now+50ms buffer if behind)
+  const now  = audioCtx.currentTime;
+  const when = Math.max(now + 0.05, nextTime);
+  src.start(when);
+  nextTime = when + f32.length / 16000;
 }
 
 function stop() {
-  if (dc && dc.readyState === 'open') {
-    dc.send(JSON.stringify({ type: 'signalling', message: { type: 'peerLeft' } }));
-  }
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
   cleanup();
 }
 
 function cleanup() {
-  clearInterval(pingTimer); pingTimer = null;
-  if (pc) { pc.close(); pc = null; }
-  dc = null; pcId = null;
-  audio.srcObject = null;
+  if (worklet)    { worklet.disconnect(); worklet = null; }
+  if (micSource)  { micSource.disconnect(); micSource = null; }
+  if (audioCtx)   { audioCtx.close(); audioCtx = null; }
+  if (stream)     { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  ws = null;
+  nextTime = 0;
   btn.textContent = '🎤';
   btn.classList.remove('active');
   btn.disabled = false;
@@ -229,7 +226,7 @@ function setStatus(msg) { status.textContent = msg; }
 function appendTranscript(role, text) {
   const row = document.createElement('div');
   row.className = 'turn ' + role;
-  row.innerHTML = `<span class="role">${role === 'user' ? 'You' : 'AI'}:</span><span class="text">${text}</span>`;
+  row.innerHTML = `<span class="role">${role === 'user' ? 'You' : 'AI'}:</span><span class="text">${escHtml(text)}</span>`;
   transcriptEl.appendChild(row);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
@@ -244,23 +241,13 @@ function appendLog(msg) {
             : '';
   const row = document.createElement('div');
   row.className = 'entry' + (cls ? ' ' + cls : '');
-  row.innerHTML = `<span class="ts">${ts}</span>${msg}`;
+  row.innerHTML = `<span class="ts">${ts}</span>${escHtml(msg)}`;
   logEl.appendChild(row);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function waitForIceGathering(pc) {
-  return new Promise(resolve => {
-    if (pc.iceGatheringState === 'complete') { resolve(); return; }
-    const check = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', check);
-    setTimeout(resolve, 3000);
-  });
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 </script>
 </body>

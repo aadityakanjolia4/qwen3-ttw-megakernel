@@ -69,7 +69,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         sample_rate: int = 16000,
         verbose: bool = True,
         tts_instance: Optional[object] = None,
-        connection: Optional[object] = None,
+        log_callback=None,
         timing: Optional[dict] = None,
     ):
         if _PIPECAT_AVAILABLE:
@@ -87,8 +87,8 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         self._target_sr = sample_rate
         self._verbose = verbose
         self._model_name = model_name
-        self._connection = connection   # SmallWebRTCConnection for sending metrics
-        self._timing = timing           # shared dict with "vad_end_ts" written by observer
+        self._log_callback = log_callback  # Callable[[dict], None] | None
+        self._timing = timing              # shared dict with "vad_end_ts" written by observer
 
         # Accept a pre-loaded instance (passed from server startup) or lazy-load.
         self._tts: Optional[object] = tts_instance
@@ -159,19 +159,17 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
 
         elapsed = time.perf_counter() - t0
 
-        if self._connection is not None and total_samples > 0:
-            # TTFC: speech-end → first audio chunk generated inside synthesis thread.
-            if first_chunk_ts and self._timing and self._timing.get("vad_end_ts"):
-                ttfc_ms = (first_chunk_ts[0] - self._timing["vad_end_ts"]) * 1000
-                self._connection.send_app_message({"type": "log", "msg": f"TTFC: {ttfc_ms:.0f} ms"})
-
-            # RTF: total synthesis time / audio duration.
+        if self._log_callback is not None and total_samples > 0:
             audio_duration = total_samples / self._target_sr
             rtf = elapsed / audio_duration
-            self._connection.send_app_message({"type": "log", "msg": f"RTF: {rtf:.3f}"})
-
+            ttfc_ms = None
+            if first_chunk_ts and self._timing and self._timing.get("vad_end_ts"):
+                ttfc_ms = (first_chunk_ts[0] - self._timing["vad_end_ts"]) * 1000
+                self._log_callback({"type": "log", "msg": f"TTFC: {ttfc_ms:.0f} ms"})
+            self._log_callback({"type": "log", "msg": f"RTF: {rtf:.3f}"})
             if self._verbose:
-                print(f"[TTS] '{sentence[:40]}' TTFC={ttfc_ms:.0f}ms RTF={rtf:.3f}")
+                ttfc_str = f"{ttfc_ms:.0f}ms" if ttfc_ms is not None else "n/a"
+                print(f"[TTS] '{sentence[:40]}' TTFC={ttfc_str} RTF={rtf:.3f}")
 
     # ------------------------------------------------------------------
     # Standalone (non-pipecat) usage
