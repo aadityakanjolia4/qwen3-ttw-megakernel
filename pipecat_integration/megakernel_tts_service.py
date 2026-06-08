@@ -27,7 +27,7 @@ import numpy as np
 # Pipecat imports — gracefully degrade if pipecat is not installed.
 try:
     from pipecat.frames.frames import EndFrame, Frame, OutputAudioRawFrame
-    from pipecat.services.tts_service import TTSService, TTSSettings
+    from pipecat.services.tts_service import TTSService, TTSSettings, TextAggregationMode
 
     _PIPECAT_AVAILABLE = True
 except ImportError:
@@ -80,6 +80,10 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
                     voice=speaker,
                     language=language,
                 ),
+                # SentenceSplitter upstream already produces complete sentences.
+                # TOKEN mode makes the base class call run_tts immediately per
+                # TextFrame instead of re-buffering everything until LLMFullResponseEndFrame.
+                text_aggregation_mode=TextAggregationMode.TOKEN,
             )
 
         self._speaker = speaker
