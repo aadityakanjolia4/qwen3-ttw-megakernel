@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qwen3 Voice Assistant</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background: #0f0f0f;
+      color: #eee;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 2rem; }
+    #btn {
+      width: 100px;
+      height: 100px;
+      border-radius: 50%;
+      border: none;
+      font-size: 2rem;
+      cursor: pointer;
+      background: #1e88e5;
+      color: white;
+      transition: background 0.2s, transform 0.1s;
+    }
+    #btn:active { transform: scale(0.95); }
+    #btn.active { background: #e53935; }
+    #btn:disabled { background: #444; cursor: default; }
+    #status { margin-top: 1.5rem; font-size: 0.9rem; color: #aaa; }
+    #transcript {
+      margin-top: 1.5rem;
+      width: min(480px, 90vw);
+      height: 160px;
+      overflow-y: auto;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.82rem;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #transcript .turn { line-height: 1.5; }
+    #transcript .turn .role { font-weight: 600; margin-right: 6px; }
+    #transcript .turn.user .role     { color: #4fc3f7; }
+    #transcript .turn.assistant .role { color: #ffb74d; }
+    #transcript .turn .text { color: #ddd; }
+    #log {
+      margin-top: 0.75rem;
+      width: min(480px, 90vw);
+      height: 160px;
+      overflow-y: auto;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.75rem;
+      font-family: monospace;
+      color: #ccc;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    #log .entry { line-height: 1.4; }
+    #log .entry .ts { color: #555; margin-right: 6px; }
+    #log .entry.ttfc { color: #4fc3f7; }
+    #log .entry.stt  { color: #fff59d; }
+    #log .entry.llm  { color: #ce93d8; }
+    #log .entry.tts  { color: #ffb74d; }
+    #log .entry.rtf  { color: #a5d6a7; }
+  </style>
+</head>
+<body>
+  <h1>Qwen3 Voice Assistant</h1>
+  <button id="btn" title="Start / Stop">🎤</button>
+  <div id="status">Click to start</div>
+  <div id="transcript"></div>
+  <div id="log"></div>
+
+<script>
+const btn          = document.getElementById('btn');
+const status       = document.getElementById('status');
+const logEl        = document.getElementById('log');
+const transcriptEl = document.getElementById('transcript');
+
+// WebSocket URL — same host, /ws path
+const WS_URL = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
+
+// AudioWorklet processor source (inline blob)
+const WORKLET_SRC = `
+class PCMCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) this.port.postMessage(ch.slice());
+    return true;
+  }
+}
+registerProcessor('pcm-capture', PCMCaptureProcessor);
+`;
+
+let ws         = null;
+let audioCtx   = null;
+let micSource  = null;
+let worklet    = null;
+let stream     = null;
+let nextTime   = 0;   // scheduled playback cursor (AudioContext time)
+
+btn.addEventListener('click', () => {
+  if (ws) stop(); else start();
+});
+
+async function start() {
+  btn.disabled = true;
+  setStatus('Requesting microphone…');
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (e) {
+    setStatus('Microphone access denied: ' + e.message);
+    btn.disabled = false;
+    return;
+  }
+
+  // AudioContext at 16 kHz so the browser resamples mic audio for us
+  audioCtx = new AudioContext({ sampleRate: 16000 });
+
+  setStatus('Connecting…');
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen  = onOpen;
+  ws.onmessage = onMessage;
+  ws.onerror = (e) => { setStatus('WebSocket error'); cleanup(); };
+  ws.onclose = () => cleanup();
+}
+
+async function onOpen() {
+  setStatus('Connected — speak now');
+  btn.textContent = '⏹';
+  btn.classList.add('active');
+  btn.disabled = false;
+
+  // Register AudioWorklet and start capturing mic → binary PCM → WebSocket
+  const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+  const url  = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  worklet = new AudioWorkletNode(audioCtx, 'pcm-capture');
+  worklet.port.onmessage = (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Float32 → Int16 little-endian
+    const f32 = e.data;
+    const buf = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      buf[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+    }
+    ws.send(buf.buffer);
+  };
+
+  micSource = audioCtx.createMediaStreamSource(stream);
+  micSource.connect(worklet);
+  // Do NOT connect worklet to destination — we don't want mic echo
+}
+
+function onMessage(e) {
+  if (e.data instanceof ArrayBuffer) {
+    // Binary = PCM audio from TTS
+    playPCM(e.data);
+  } else {
+    // Text = JSON control (log, transcript)
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'log')        appendLog(msg.msg);
+      if (msg.type === 'transcript') appendTranscript(msg.role, msg.text);
+    } catch (_) {}
+  }
+}
+
+function playPCM(arrayBuffer) {
+  // Raw 16-bit PCM @ 16 kHz mono
+  const i16   = new Int16Array(arrayBuffer);
+  const f32   = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+
+  const buf = audioCtx.createBuffer(1, f32.length, 16000);
+  buf.copyToChannel(f32, 0);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+
+  // Schedule gaplessly: always start at nextTime (or now+50ms buffer if behind)
+  const now  = audioCtx.currentTime;
+  const when = Math.max(now + 0.05, nextTime);
+  src.start(when);
+  nextTime = when + f32.length / 16000;
+}
+
+function stop() {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  cleanup();
+}
+
+function cleanup() {
+  if (worklet)    { worklet.disconnect(); worklet = null; }
+  if (micSource)  { micSource.disconnect(); micSource = null; }
+  if (audioCtx)   { audioCtx.close(); audioCtx = null; }
+  if (stream)     { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  ws = null;
+  nextTime = 0;
+  btn.textContent = '🎤';
+  btn.classList.remove('active');
+  btn.disabled = false;
+  setStatus('Click to start');
+}
+
+function setStatus(msg) { status.textContent = msg; }
+
+function appendTranscript(role, text) {
+  const row = document.createElement('div');
+  row.className = 'turn ' + role;
+  row.innerHTML = `<span class="role">${role === 'user' ? 'You' : 'AI'}:</span><span class="text">${escHtml(text)}</span>`;
+  transcriptEl.appendChild(row);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function appendLog(msg) {
+  const ts  = new Date().toTimeString().slice(0, 8);
+  const cls = msg.startsWith('TTFC') ? 'ttfc'
+            : msg.startsWith('RTF')  ? 'rtf'
+            : msg.startsWith('STT')  ? 'stt'
+            : msg.startsWith('LLM')  ? 'llm'
+            : msg.startsWith('TTS')  ? 'tts'
+            : '';
+  const row = document.createElement('div');
+  row.className = 'entry' + (cls ? ' ' + cls : '');
+  row.innerHTML = `<span class="ts">${ts}</span>${escHtml(msg)}`;
+  logEl.appendChild(row);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>

@@ -74,7 +74,9 @@ def load_talker_weights(
     _load_kwargs = dict(dtype=torch.bfloat16, device_map="cuda")
     try:
         hf_model = AutoModel.from_pretrained(model_name, local_files_only=True, **_load_kwargs)
-    except EnvironmentError:
+    except (EnvironmentError, AttributeError):
+        # AttributeError: newer transformers raises this instead of EnvironmentError
+        # when checkpoint_files is None (model not in local cache).
         hf_model = AutoModel.from_pretrained(model_name, **_load_kwargs)
     hf_model.eval()
 

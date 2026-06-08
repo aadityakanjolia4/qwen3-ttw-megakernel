@@ -171,7 +171,7 @@ class TalkerDecoder:
 
         # _norm_out is populated by the kernel after the final RMSNorm.
         # Clone before next step overwrites it.
-        hidden = self._norm_out.clone().to(torch.float32).unsqueeze(0).unsqueeze(0)
+        hidden = self._norm_out.to(torch.float32).unsqueeze(0).unsqueeze(0)
         return token_id, hidden
 
     # ------------------------------------------------------------------
