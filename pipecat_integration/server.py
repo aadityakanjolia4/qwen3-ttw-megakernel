@@ -82,10 +82,12 @@ class PCMSerializer(FrameSerializer):
 # ---------------------------------------------------------------------------
 
 class PipelineLogger(BaseObserver):
-    def __init__(self, websocket: WebSocket, timing: dict):
+    def __init__(self, websocket: WebSocket, timing: dict, tts_instance=None, speaker: str = "aiden"):
         super().__init__()
         self._ws = websocket
         self._timing = timing
+        self._tts_instance = tts_instance
+        self._speaker = speaker
         self._llm_buf: list[str] = []
         self._seen_ids: set[int] = set()
 
@@ -126,6 +128,11 @@ class PipelineLogger(BaseObserver):
             self._llm_buf = []
         elif isinstance(frame, TTSStartedFrame):
             self._log("TTS: started")
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            # Keep GPU cache warm so the next turn's vocoder call stays fast
+            if self._tts_instance is not None:
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(None, _keep_warm, self._tts_instance, self._speaker)
         elif isinstance(frame, MetricsFrame):
             pass
 
@@ -189,6 +196,16 @@ def _warmup_tts(tts, speaker: str):
         print("[Startup] TTS warmup done.")
     except Exception as exc:
         print(f"[Startup] TTS warmup failed (non-fatal): {exc}")
+
+
+def _keep_warm(tts, speaker: str):
+    """Synthesize a short dummy phrase to keep GPU L2 cache warm between turns."""
+    if tts is None:
+        return
+    try:
+        tts.synthesize("Okay.", speaker=speaker, language="English", chunk_callback=lambda a, s: None)
+    except Exception:
+        pass
 
 
 @asynccontextmanager
@@ -288,7 +305,7 @@ async def _run_pipeline(websocket: WebSocket):
     )
 
     timing = {"vad_end_ts": 0.0}
-    obs = PipelineLogger(websocket, timing)
+    obs = PipelineLogger(websocket, timing, tts_instance=_loaded_tts, speaker=_cfg["speaker"])
 
     if _loaded_tts is not None:
         tts = MegakernelTTSService(

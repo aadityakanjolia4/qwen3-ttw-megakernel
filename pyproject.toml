@@ -25,6 +25,9 @@ dependencies = [
   # core
   "torch>=2.0.0",
   "torchaudio",
+  # CUDA shared libs (pip-installed; preloaded at startup via qwen3_cuda_preload.pth)
+  "nvidia-cublas-cu12",
+  "nvidia-cudnn-cu12",
   "transformers==4.57.3",
   "accelerate==1.12.0",
   # megakernel JIT build (triton not available on macOS — optional)

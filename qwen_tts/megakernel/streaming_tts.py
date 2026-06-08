@@ -29,7 +29,7 @@ from .talker_weights import TALKER_MAX_SEQ_LEN, load_code_predictor_weights, loa
 
 # Vocoder decode is called every CHUNK_FRAMES codec frames.
 # At 12 Hz, 1 frame = 83 ms of audio → minimum TTFC.
-CHUNK_FRAMES = 1
+CHUNK_FRAMES = 2
 
 # Context frames prepended to each vocoder call to eliminate boundary artifacts.
 # The neural vocoder has a large receptive field; decoding single frames in isolation
@@ -143,10 +143,10 @@ class StreamingTTSMegakernel:
         # First call triggers compilation per shape; subsequent calls hit the CUDA graph.
         if verbose:
             print("Warming vocoder for all overlap sizes ...")
-        for _nf in range(1, OVERLAP_FRAMES + 2):
+        for _nf in range(1, CHUNK_FRAMES + OVERLAP_FRAMES + 1):
             _dummy = torch.zeros(_nf, self._num_code_groups, dtype=torch.long, device=device)
             _warmup_audio, _ = self._decode_audio_chunk(_dummy)
-        self._samples_per_frame = len(_warmup_audio) // (OVERLAP_FRAMES + 1)
+        self._samples_per_frame = len(_warmup_audio) // (CHUNK_FRAMES + OVERLAP_FRAMES)
         torch.cuda.synchronize()
 
         if verbose:
