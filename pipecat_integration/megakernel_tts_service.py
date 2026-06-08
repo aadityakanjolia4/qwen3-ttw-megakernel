@@ -123,6 +123,8 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         total_samples = 0
         first_chunk_ts: list[float] = []  # mutable container for thread callback
 
+        t_synth_start: list[float] = []  # captured inside the executor thread
+
         def on_chunk(audio: np.ndarray, sr: int) -> None:
             nonlocal total_samples
             if not first_chunk_ts:
@@ -136,22 +138,14 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
             )
             asyncio.run_coroutine_threadsafe(queue.put(frame), loop)
 
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        except Exception:
-            pass
+        def _synth():
+            t_synth_start.append(time.perf_counter())
+            return self._tts.synthesize(
+                sentence, self._speaker, self._language, on_chunk
+            )
 
         t0 = time.perf_counter()
-        synthesis_future = loop.run_in_executor(
-            None,
-            self._tts.synthesize,
-            sentence,
-            self._speaker,
-            self._language,
-            on_chunk,
-        )
+        synthesis_future = loop.run_in_executor(None, _synth)
 
         ttfc_logged = False
         done = False
@@ -161,8 +155,15 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
                 yield frame
                 if not ttfc_logged and first_chunk_ts and self._log_callback is not None:
                     ttfc_logged = True
-                    ttfc_ms = (first_chunk_ts[0] - t0) * 1000
-                    self._log_callback({"type": "log", "msg": f"TTFC: {ttfc_ms:.0f} ms"})
+                    exec_delay = (t_synth_start[0] - t0) * 1000 if t_synth_start else 0
+                    synth_ttfc  = (first_chunk_ts[0] - t_synth_start[0]) * 1000 if t_synth_start else 0
+                    total_ttfc  = (first_chunk_ts[0] - t0) * 1000
+                    print(
+                        f"[TTFC] executor_delay={exec_delay:.1f}ms  "
+                        f"synth={synth_ttfc:.1f}ms  total={total_ttfc:.1f}ms",
+                        flush=True,
+                    )
+                    self._log_callback({"type": "log", "msg": f"TTFC: {total_ttfc:.0f} ms"})
             except asyncio.TimeoutError:
                 if synthesis_future.done():
                     done = True
