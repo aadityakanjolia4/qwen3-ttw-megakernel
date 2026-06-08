@@ -26,7 +26,7 @@ import numpy as np
 
 # Pipecat imports — gracefully degrade if pipecat is not installed.
 try:
-    from pipecat.frames.frames import AudioRawFrame, EndFrame, Frame
+    from pipecat.frames.frames import EndFrame, Frame, OutputAudioRawFrame
     from pipecat.services.tts_service import TTSService, TTSSettings
 
     _PIPECAT_AVAILABLE = True
@@ -37,7 +37,7 @@ except ImportError:
         """Stub for environments without pipecat installed."""
         pass
 
-    class AudioRawFrame:  # type: ignore[no-redef]
+    class OutputAudioRawFrame:  # type: ignore[no-redef]
         def __init__(self, audio, sample_rate, num_channels):
             self.audio = audio
             self.sample_rate = sample_rate
@@ -124,7 +124,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
                 first_chunk_ts.append(time.perf_counter())
             total_samples += len(audio)
             pcm = _to_pcm16(audio, src_sr=sr, dst_sr=self._target_sr)
-            frame = AudioRawFrame(
+            frame = OutputAudioRawFrame(
                 audio=pcm.tobytes(),
                 sample_rate=self._target_sr,
                 num_channels=1,
