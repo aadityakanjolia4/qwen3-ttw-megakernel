@@ -181,6 +181,17 @@ def _download_whisper(model_name: str):
         print(f"[Startup] Whisper pre-download skipped: {exc}")
 
 
+def _warmup_tts(tts, speaker: str):
+    if tts is None:
+        return
+    print("[Startup] Warming up TTS (compiling CUDA kernels) ...")
+    try:
+        tts.synthesize("Hello.", speaker=speaker, language="English", chunk_callback=lambda a, s: None)
+        print("[Startup] TTS warmup done.")
+    except Exception as exc:
+        print(f"[Startup] TTS warmup failed (non-fatal): {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _loaded_tts, _loaded_llm_model, _loaded_llm_tokenizer
@@ -191,6 +202,7 @@ async def lifespan(app: FastAPI):
     _loaded_tts = await loop.run_in_executor(None, _load_tts)
     _loaded_llm_model, _loaded_llm_tokenizer = await loop.run_in_executor(None, _load_llm)
     await loop.run_in_executor(None, _download_whisper, _cfg["whisper_model"])
+    await loop.run_in_executor(None, _warmup_tts, _loaded_tts, _cfg["speaker"])
 
     print("\n[Startup] All models ready — accepting connections.\n")
     yield
