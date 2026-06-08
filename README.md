@@ -14,10 +14,6 @@ cd qwen3-tts-megakernel
 pip install -e .
 ```
 
-`pip install -e .` handles everything:
-- Installs all dependencies including `nvidia-cublas-cu12` and `nvidia-cudnn-cu12`
-- Writes a `.pth` hook to site-packages so CUDA libraries are preloaded at every Python startup — no manual `export LD_LIBRARY_PATH` needed
-
 ---
 
 ## Start the Server
@@ -75,62 +71,8 @@ Loads all models once and runs the full STT → LLM → TTS chain for each file,
 | input3.wav | 47.3 | 0.227 | 337.4 |
 
 - **TTFC** — time from start of synthesis to first audio chunk delivered
-- **RTF** — real-time factor: `wall_time / audio_duration` (lower is faster; < 1.0 means faster than real-time)
+- **RTF** — real-time factor: `wall_time / audio_duration` (< 1.0 = faster than real-time)
 - **Decode tok/s** — codec tokens decoded per second by the megakernel talker backbone
-
----
-
-## How We Reduced TTFC and RTF
-
-### 1. `torch.compile` on the vocoder decoder
-
-The vocoder decoder (HiFi-GAN style) launches ~40 CUDA kernels per call. Without compilation, each call took ~75 ms.
-
-```python
-self._speech_tokenizer.model.decoder = torch.compile(
-    self._speech_tokenizer.model.decoder,
-    mode="reduce-overhead",
-    fullgraph=False,
-)
-```
-
-`reduce-overhead` mode captures CUDA graphs, reducing per-call overhead from ~75 ms to ~30 ms.
-
-### 2. `CHUNK_FRAMES` — amortise vocoder overhead
-
-The vocoder is called once every `CHUNK_FRAMES` codec frames. Each frame is 83 ms of audio at 12 Hz.
-
-| CHUNK_FRAMES | Audio per call | Vocoder cost | RTF |
-|:---:|---:|---:|---:|
-| 1 | 83 ms | ~30 ms | ~0.38 |
-| 4 | 333 ms | ~30 ms | ~0.09 |
-
-Setting `CHUNK_FRAMES = 4` means each 30 ms vocoder call produces 333 ms of audio — an 11× amortisation — bringing RTF from ~0.38 down to ~0.09 on RTX 5090.
-
-### 3. `OVERLAP_FRAMES` — continuity across chunks
-
-`OVERLAP_FRAMES = 4` carries codec context from the previous chunk into each vocoder call, preventing audio discontinuities at chunk boundaries without any extra latency cost.
-
-### 4. Warmup loop for CUDA graph capture
-
-`torch.compile(mode='reduce-overhead')` captures CUDA graphs on first use for each unique input shape. The warmup loop covers all shapes from `T=1` to `T=CHUNK_FRAMES + OVERLAP_FRAMES` so the first real synthesis call hits fully compiled paths:
-
-```python
-for t in range(1, CHUNK_FRAMES + OVERLAP_FRAMES + 1):
-    _warmup_vocoder(t)
-```
-
-### 5. `TextAggregationMode.SENTENCE` + single `synthesize()` call
-
-Rather than splitting the LLM response into sentences and calling TTS once per sentence (which causes a re-prefill penalty each time), the pipeline accumulates the full LLM response and calls `synthesize()` once. This matches `test_pipeline.py` behaviour and keeps TTFC deterministic.
-
-### 6. GPU L2 cache keep-warm
-
-Between turns the GPU L2 cache goes cold, adding ~25 ms to the next turn's TTFC. After each response the server synthesises a short silent phrase to keep the vocoder weights in L2:
-
-```python
-tts.synthesize("Okay.", speaker=speaker, language="English", chunk_callback=lambda a, s: None)
-```
 
 ---
 
@@ -161,10 +103,59 @@ Browser mic (PCM 16kHz)
 
 ---
 
+## Changes from [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel)
+
+The upstream repo is a **pure text LM decoder** — it makes next-token generation fast for Qwen3-0.6B via a single fused CUDA kernel. There is no TTS, no audio, no streaming, no pipecat. This project adapted that kernel for the Qwen3-TTS talker backbone and built a full real-time voice pipeline on top.
+
+### `csrc/kernel.cu` — made architecture configurable
+
+The upstream hardcodes all model dimensions for Qwen3-0.6B (LM):
+
+```c
+constexpr int HIDDEN_SIZE       = 1024;
+constexpr int INTERMEDIATE_SIZE = 3072;
+constexpr int NUM_KV_HEADS      = 8;
+```
+
+The TTS talker backbone has different dimensions (`INTERMEDIATE_SIZE=2048`, `NUM_KV_HEADS=2`). Every constant was wrapped in `#ifndef` preprocessor guards so the same `.cu` file compiles into two separate ops without touching any kernel logic:
+
+```c
+#ifndef LDG_INTERMEDIATE_SIZE
+#define LDG_INTERMEDIATE_SIZE 3072
+#endif
+constexpr int INTERMEDIATE_SIZE = LDG_INTERMEDIATE_SIZE;
+```
+
+### `qwen_megakernel/build.py` — second TTS build target
+
+Added `get_tts_extension()` which compiles a second shared library `qwen_tts_megakernel_C` with TTS-specific flags (`INTERMEDIATE_SIZE=2048`, `NUM_KV_HEADS=2`, smaller LM head blocks for the 3072-token codec vocab). Both ops coexist in the same Python process.
+
+### `qwen_tts/megakernel/` — entire TTS decode stack (new)
+
+The upstream has no TTS code. These three files were written from scratch to plug the megakernel into the Qwen3-TTS pipeline:
+
+| File | Purpose |
+|------|---------|
+| `talker_weights.py` | Loads the TTS talker weights from HuggingFace, extracts per-layer tensors and RoPE tables, loads code predictor weights separately |
+| `talker_decoder.py` | Stateful megakernel decoder for the 20-layer talker backbone. Handles prefill, per-step decode, KV cache injection, and the 5-layer sub-talker (code predictor) for generating all 32 codec groups per frame |
+| `streaming_tts.py` | End-to-end synthesis: text → prefill → talker decode → sub-talker → vocoder → audio chunks. Key parameters: `CHUNK_FRAMES=4` (vocoder called every 4 frames = 333 ms of audio per call, reducing RTF from ~0.38 to ~0.10), `OVERLAP_FRAMES=4` (context overlap to prevent boundary glitches), `torch.compile(mode="reduce-overhead")` on the vocoder decoder (reduces per-call cost from ~75 ms to ~30 ms) |
+
+### `pipecat_integration/` — real-time pipeline (new)
+
+Not present in the upstream at all. Built from scratch:
+
+| File | Purpose |
+|------|---------|
+| `server.py` | FastAPI WebSocket server. Pre-loads all models at startup. `PCMSerializer` bridges raw binary PCM (browser) ↔ pipecat frames. `PipelineLogger` observer streams logs and transcripts to the browser as JSON over the same WebSocket |
+| `megakernel_tts_service.py` | Pipecat `TTSService` wrapper. Runs synthesis in a thread pool executor, streams `OutputAudioRawFrame` chunks via `asyncio.Queue` as they arrive. Uses `TextAggregationMode.SENTENCE` so the full LLM response is synthesised in one call — matching `test_pipeline.py` latency |
+| `qwen3_llm_service.py` | Local Qwen3-0.6B LLM service (no API, no Ollama). Two-thread pattern: one thread runs `model.generate()`, another reads the `TextIteratorStreamer` and strips `<think>` blocks. Appends `/no_think` to disable chain-of-thought for voice responses |
+
+---
+
 ## Requirements
 
 - CUDA 12.8+
-- RTX 5090 (sm_120) — not tested on other GPUs
+- RTX 5090 (sm_120a) — not tested on other GPUs
 - Python ≥ 3.9
 - PyTorch ≥ 2.7
 
