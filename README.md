@@ -21,13 +21,13 @@ pip install -e .
 ```bash
 python -m pipecat_integration.server \
     --host 0.0.0.0 \
-    --port 8080 \
+    --port 8081 \
     --tts-model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
     --speaker aiden \
     --whisper-model base
 ```
 
-Then open `http://<your-server-ip>:8080` in a browser. The page streams mic audio over WebSocket and plays back TTS audio in real time.
+Then open `http://<your-server-ip>:8081` in a browser. The page streams mic audio over WebSocket and plays back TTS audio in real time.
 
 ---
 

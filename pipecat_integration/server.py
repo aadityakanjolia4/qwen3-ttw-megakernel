@@ -2,9 +2,9 @@
 
 Run on Vast.ai:
   pip install -e ".[webrtc]"
-  python -m pipecat_integration.server --port 8080
+  python -m pipecat_integration.server --port 8081
 
-Then open  http://<vast-ip>:8080  in your browser.
+Then open  http://<vast-ip>:8081  in your browser.
 Works through ngrok / SSH TCP tunnels (WebSocket, no UDP required).
 """
 
@@ -349,7 +349,7 @@ async def _run_pipeline(websocket: WebSocket):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--tts-model", default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
     parser.add_argument("--speaker", default="aiden")
     parser.add_argument("--whisper-model", default="base")
