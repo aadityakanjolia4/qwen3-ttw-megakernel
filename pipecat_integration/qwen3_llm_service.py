@@ -53,11 +53,13 @@ class Qwen3LLMService(FrameProcessor):
         enable_thinking: bool = False,
         model=None,
         tokenizer=None,
+        system_messages: list = None,
     ):
         super().__init__()
         self._max_new_tokens = max_new_tokens
         self._temperature = temperature
         self._enable_thinking = enable_thinking
+        self._system_messages = [m for m in (system_messages or []) if m.get("role") == "system"]
 
         if model is not None and tokenizer is not None:
             # Accept pre-loaded model+tokenizer (passed from server startup).
@@ -88,10 +90,12 @@ class Qwen3LLMService(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        from pipecat.frames.frames import LLMContextFrame
+        from pipecat.frames.frames import TranscriptionFrame
 
-        if isinstance(frame, LLMContextFrame):
-            await self._generate(frame.context.messages)
+        if isinstance(frame, TranscriptionFrame):
+            print(f"[LLM] TranscriptionFrame: {frame.text!r}", flush=True)
+            msgs = self._system_messages + [{"role": "user", "content": frame.text}]
+            await self._generate(msgs)
         else:
             await self.push_frame(frame, direction)
 
@@ -100,6 +104,7 @@ class Qwen3LLMService(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def _generate(self, messages: list):
+        print(f"[LLM] generating for {len(messages)} messages", flush=True)
         from pipecat.frames.frames import (
             LLMFullResponseEndFrame,
             LLMFullResponseStartFrame,
@@ -129,24 +134,58 @@ class Qwen3LLMService(FrameProcessor):
             skip_special_tokens=True,
         )
 
+        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
         gen_kwargs = dict(
             **inputs,
             streamer=streamer,
             max_new_tokens=self._max_new_tokens,
             temperature=self._temperature,
             do_sample=self._temperature > 0,
+            pad_token_id=pad_id,
         )
 
         token_queue: stdlib_queue.Queue = stdlib_queue.Queue()
 
-        def _run():
-            try:
+        def _run_gen():
+            with torch.inference_mode():
                 self._model.generate(**gen_kwargs)
+
+        def _run_read():
+            in_think = False
+            buf = ""
+            try:
+                for text in streamer:
+                    if not text:
+                        continue
+                    buf += text
+                    # Strip <think>...</think> blocks that Qwen3 leaks even with /no_think
+                    while True:
+                        if in_think:
+                            end = buf.find("</think>")
+                            if end == -1:
+                                buf = ""  # discard mid-think content
+                                break
+                            buf = buf[end + len("</think>"):]
+                            in_think = False
+                        else:
+                            start = buf.find("<think>")
+                            if start == -1:
+                                token_queue.put(buf)
+                                buf = ""
+                                break
+                            if start > 0:
+                                token_queue.put(buf[:start])
+                            buf = buf[start + len("<think>"):]
+                            in_think = True
             finally:
+                if buf and not in_think:
+                    token_queue.put(buf)
                 token_queue.put(None)
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+        gen_thread = threading.Thread(target=_run_gen, daemon=True)
+        read_thread = threading.Thread(target=_run_read, daemon=True)
+        gen_thread.start()
+        read_thread.start()
 
         loop = asyncio.get_event_loop()
         await self.push_frame(LLMFullResponseStartFrame())
@@ -159,28 +198,34 @@ class Qwen3LLMService(FrameProcessor):
                 await self.push_frame(TextFrame(token))
 
         await self.push_frame(LLMFullResponseEndFrame())
-        thread.join()
+        gen_thread.join()
+        read_thread.join()
 
 
 # ---------------------------------------------------------------------------
 # Sentence splitter — pushes complete sentences to TTS immediately
 # ---------------------------------------------------------------------------
 
-_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+_SENTENCE_END = re.compile(r'(?<=[.!?,;:])\s+')
+
+# Flush to TTS after this many words even with no punctuation.
+# Lower = faster TTFC, but synthesis of very short phrases sounds robotic.
+MIN_WORDS_TO_FLUSH = 4
 
 
 class SentenceSplitter(FrameProcessor):
-    """Buffers streaming TextFrames and pushes each complete sentence at once.
+    """Buffers streaming TextFrames and flushes to TTS at clause boundaries.
 
-    Without this, the TTS service receives individual sub-word tokens and
-    either buffers everything (high latency) or tries to synthesise fragments
-    (bad audio).  With sentence splitting the TTS starts on the first complete
-    sentence while the LLM is still generating the second.
+    Flushes when:
+      1. A punctuation boundary is hit (.  !  ?  ,  ;  :), OR
+      2. The buffer has accumulated MIN_WORDS_TO_FLUSH words with no boundary yet.
+    This gives TTS the shortest possible chunk that still sounds natural.
     """
 
-    def __init__(self):
+    def __init__(self, min_words: int = MIN_WORDS_TO_FLUSH):
         super().__init__()
         self._buffer = ""
+        self._min_words = min_words
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -194,6 +239,12 @@ class SentenceSplitter(FrameProcessor):
                 s = s.strip()
                 if s:
                     await self.push_frame(TextFrame(s))
+            # Force-flush if buffer has enough words but no punctuation yet
+            if len(self._buffer.split()) >= self._min_words:
+                chunk = self._buffer.strip()
+                if chunk:
+                    await self.push_frame(TextFrame(chunk))
+                self._buffer = ""
         elif isinstance(frame, LLMFullResponseEndFrame):
             tail = self._buffer.strip()
             if tail:
