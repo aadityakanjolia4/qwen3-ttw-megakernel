@@ -29,7 +29,7 @@ from .talker_weights import TALKER_MAX_SEQ_LEN, load_code_predictor_weights, loa
 
 # Vocoder decode is called every CHUNK_FRAMES codec frames.
 # At 12 Hz, 1 frame = 83 ms of audio → minimum TTFC.
-CHUNK_FRAMES = 1
+CHUNK_FRAMES = 2
 
 # Context frames prepended to each vocoder call to eliminate boundary artifacts.
 # The neural vocoder has a large receptive field; decoding single frames in isolation
