@@ -80,10 +80,11 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
                     voice=speaker,
                     language=language,
                 ),
-                # SentenceSplitter upstream already produces complete sentences.
-                # TOKEN mode makes the base class call run_tts immediately per
-                # TextFrame instead of re-buffering everything until LLMFullResponseEndFrame.
-                text_aggregation_mode=TextAggregationMode.TOKEN,
+                # SENTENCE mode accumulates the full LLM response before calling
+                # run_tts — one synthesize call for the full text, matching test_pipeline.
+                # The megakernel streams internally at CHUNK_FRAMES=1, so TTFC is
+                # prefill(full_text) + 1 decode step + 1 vocoder call.
+                text_aggregation_mode=TextAggregationMode.SENTENCE,
             )
 
         self._speaker = speaker

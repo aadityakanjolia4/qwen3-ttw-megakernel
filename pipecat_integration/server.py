@@ -42,7 +42,7 @@ from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 from pipecat_integration.megakernel_tts_service import MegakernelTTSService
-from pipecat_integration.qwen3_llm_service import Qwen3LLMService, SentenceSplitter
+from pipecat_integration.qwen3_llm_service import Qwen3LLMService
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +288,6 @@ async def _run_pipeline(websocket: WebSocket):
         system_messages=system_messages,
     )
 
-    splitter = SentenceSplitter()
-
     timing = {"vad_end_ts": 0.0}
     obs = PipelineLogger(websocket, timing)
 
@@ -303,7 +301,7 @@ async def _run_pipeline(websocket: WebSocket):
             timing=timing,
         )
         stages = [
-            transport.input(), vad, stt, llm, splitter,
+            transport.input(), vad, stt, llm,
             tts, transport.output(),
         ]
     else:
