@@ -171,6 +171,7 @@ class StreamingTTSMegakernel:
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
+        stats_out: Optional[dict] = None,
     ) -> tuple[np.ndarray, int]:
         """Synthesize text to speech, optionally streaming chunks.
 
@@ -339,10 +340,19 @@ class StreamingTTSMegakernel:
         total_audio_s = len(codec_frames) / 12.0  # 12 Hz codec
         wall_s = t_end - t_start
         rtf = wall_s / max(total_audio_s, 1e-6)
+        decode_tps = len(codec_frames) / t_decode_accum if t_decode_accum > 0 else 0
         print(
             f"[Megakernel TTS] {len(codec_frames)} frames | "
+            f"decode={decode_tps:.0f} tok/s | "
             f"wall={wall_s*1000:.0f} ms | audio={total_audio_s*1000:.0f} ms | RTF={rtf:.3f}"
         )
+
+        if stats_out is not None:
+            stats_out["frames"] = len(codec_frames)
+            stats_out["decode_tps"] = decode_tps
+            stats_out["rtf"] = rtf
+            stats_out["wall_ms"] = wall_s * 1000
+            stats_out["audio_ms"] = total_audio_s * 1000
 
         full_audio = np.concatenate(audio_chunks) if audio_chunks else np.zeros(0)
         return full_audio, sr

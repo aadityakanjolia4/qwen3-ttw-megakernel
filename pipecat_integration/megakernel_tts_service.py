@@ -124,6 +124,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         first_chunk_ts: list[float] = []  # mutable container for thread callback
 
         t_synth_start: list[float] = []  # captured inside the executor thread
+        synth_stats: dict = {}
 
         def on_chunk(audio: np.ndarray, sr: int) -> None:
             nonlocal total_samples
@@ -141,7 +142,8 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         def _synth():
             t_synth_start.append(time.perf_counter())
             return self._tts.synthesize(
-                sentence, self._speaker, self._language, on_chunk
+                sentence, self._speaker, self._language, on_chunk,
+                stats_out=synth_stats,
             )
 
         t0 = time.perf_counter()
@@ -180,10 +182,14 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
         if self._log_callback is not None and total_samples > 0:
             audio_duration = total_samples / self._target_sr
             rtf = elapsed / audio_duration
-            self._log_callback({"type": "log", "msg": f"RTF: {rtf:.3f}  ({elapsed*1000:.0f}ms for {audio_duration:.2f}s audio)"})
+            decode_tps = synth_stats.get("decode_tps", 0)
+            self._log_callback({
+                "type": "log",
+                "msg": f"Decode: {decode_tps:.0f} tok/s  RTF: {rtf:.3f}",
+            })
             if self._verbose:
                 ttfc_str = f"{(first_chunk_ts[0] - t0)*1000:.0f}ms" if first_chunk_ts else "n/a"
-                print(f"[TTS] '{sentence[:40]}' TTFC={ttfc_str} RTF={rtf:.3f}")
+                print(f"[TTS] '{sentence[:40]}' TTFC={ttfc_str} RTF={rtf:.3f} decode={decode_tps:.0f}tok/s")
 
     # ------------------------------------------------------------------
     # Standalone (non-pipecat) usage
