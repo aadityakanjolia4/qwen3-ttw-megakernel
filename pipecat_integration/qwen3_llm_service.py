@@ -208,19 +208,24 @@ class Qwen3LLMService(FrameProcessor):
 
 _SENTENCE_END = re.compile(r'(?<=[.!?,;:])\s+')
 
+# Flush to TTS after this many words even with no punctuation.
+# Lower = faster TTFC, but synthesis of very short phrases sounds robotic.
+MIN_WORDS_TO_FLUSH = 4
+
 
 class SentenceSplitter(FrameProcessor):
-    """Buffers streaming TextFrames and pushes each complete sentence at once.
+    """Buffers streaming TextFrames and flushes to TTS at clause boundaries.
 
-    Without this, the TTS service receives individual sub-word tokens and
-    either buffers everything (high latency) or tries to synthesise fragments
-    (bad audio).  With sentence splitting the TTS starts on the first complete
-    sentence while the LLM is still generating the second.
+    Flushes when:
+      1. A punctuation boundary is hit (.  !  ?  ,  ;  :), OR
+      2. The buffer has accumulated MIN_WORDS_TO_FLUSH words with no boundary yet.
+    This gives TTS the shortest possible chunk that still sounds natural.
     """
 
-    def __init__(self):
+    def __init__(self, min_words: int = MIN_WORDS_TO_FLUSH):
         super().__init__()
         self._buffer = ""
+        self._min_words = min_words
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -234,6 +239,12 @@ class SentenceSplitter(FrameProcessor):
                 s = s.strip()
                 if s:
                     await self.push_frame(TextFrame(s))
+            # Force-flush if buffer has enough words but no punctuation yet
+            if len(self._buffer.split()) >= self._min_words:
+                chunk = self._buffer.strip()
+                if chunk:
+                    await self.push_frame(TextFrame(chunk))
+                self._buffer = ""
         elif isinstance(frame, LLMFullResponseEndFrame):
             tail = self._buffer.strip()
             if tail:
