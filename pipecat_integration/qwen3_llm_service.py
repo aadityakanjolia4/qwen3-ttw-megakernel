@@ -182,7 +182,7 @@ class Qwen3LLMService(FrameProcessor):
 # Sentence splitter — pushes complete sentences to TTS immediately
 # ---------------------------------------------------------------------------
 
-_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+_SENTENCE_END = re.compile(r'(?<=[.!?,;:])\s+')
 
 
 class SentenceSplitter(FrameProcessor):

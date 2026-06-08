@@ -131,6 +131,13 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
             )
             asyncio.run_coroutine_threadsafe(queue.put(frame), loop)
 
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
         t0 = time.perf_counter()
         synthesis_future = loop.run_in_executor(
             None,
