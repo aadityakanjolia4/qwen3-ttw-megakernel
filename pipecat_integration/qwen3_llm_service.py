@@ -90,7 +90,10 @@ class Qwen3LLMService(FrameProcessor):
 
         from pipecat.frames.frames import LLMContextFrame
 
+        print(f"[LLM] received frame: {type(frame).__name__}", flush=True)
+
         if isinstance(frame, LLMContextFrame):
+            print(f"[LLM] LLMContextFrame received — starting generation", flush=True)
             await self._generate(frame.context.messages)
         else:
             await self.push_frame(frame, direction)
@@ -100,6 +103,7 @@ class Qwen3LLMService(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def _generate(self, messages: list):
+        print(f"[LLM] _generate called with {len(messages)} messages", flush=True)
         from pipecat.frames.frames import (
             LLMFullResponseEndFrame,
             LLMFullResponseStartFrame,
@@ -230,8 +234,13 @@ class LLMUserContextAggregator(FrameProcessor):
         from pipecat.frames.frames import LLMContextFrame, TranscriptionFrame
         from pipecat.processors.aggregators.llm_context import LLMContext
 
+        print(f"[UserAgg] received frame: {type(frame).__name__}", flush=True)
+
         if isinstance(frame, TranscriptionFrame):
+            print(f"[UserAgg] TranscriptionFrame text={frame.text!r}", flush=True)
             msgs = self._system_messages + [{"role": "user", "content": frame.text}]
-            await self.push_frame(LLMContextFrame(context=LLMContext(messages=msgs)))
+            ctx_frame = LLMContextFrame(context=LLMContext(messages=msgs))
+            print(f"[UserAgg] pushing LLMContextFrame with {len(msgs)} messages", flush=True)
+            await self.push_frame(ctx_frame)
         else:
             await self.push_frame(frame, direction)
