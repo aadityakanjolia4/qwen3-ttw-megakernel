@@ -144,14 +144,21 @@ class Qwen3LLMService(FrameProcessor):
 
         token_queue: stdlib_queue.Queue = stdlib_queue.Queue()
 
-        def _run():
+        def _run_gen():
+            self._model.generate(**gen_kwargs)
+
+        def _run_read():
             try:
-                self._model.generate(**gen_kwargs)
+                for text in streamer:
+                    if text:
+                        token_queue.put(text)
             finally:
                 token_queue.put(None)
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+        gen_thread = threading.Thread(target=_run_gen, daemon=True)
+        read_thread = threading.Thread(target=_run_read, daemon=True)
+        gen_thread.start()
+        read_thread.start()
 
         loop = asyncio.get_event_loop()
         await self.push_frame(LLMFullResponseStartFrame())
@@ -164,7 +171,8 @@ class Qwen3LLMService(FrameProcessor):
                 await self.push_frame(TextFrame(token))
 
         await self.push_frame(LLMFullResponseEndFrame())
-        thread.join()
+        gen_thread.join()
+        read_thread.join()
 
 
 # ---------------------------------------------------------------------------
