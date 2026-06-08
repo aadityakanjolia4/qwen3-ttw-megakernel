@@ -134,18 +134,21 @@ class Qwen3LLMService(FrameProcessor):
             skip_special_tokens=True,
         )
 
+        pad_id = self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
         gen_kwargs = dict(
             **inputs,
             streamer=streamer,
             max_new_tokens=self._max_new_tokens,
             temperature=self._temperature,
             do_sample=self._temperature > 0,
+            pad_token_id=pad_id,
         )
 
         token_queue: stdlib_queue.Queue = stdlib_queue.Queue()
 
         def _run_gen():
-            self._model.generate(**gen_kwargs)
+            with torch.inference_mode():
+                self._model.generate(**gen_kwargs)
 
         def _run_read():
             try:
