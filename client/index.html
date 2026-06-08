@@ -54,7 +54,7 @@
     #log {
       margin-top: 0.75rem;
       width: min(480px, 90vw);
-      height: 120px;
+      height: 160px;
       overflow-y: auto;
       background: #1a1a1a;
       border: 1px solid #333;
@@ -69,10 +69,10 @@
     }
     #log .entry { line-height: 1.4; }
     #log .entry .ts { color: #555; margin-right: 6px; }
-    #log .entry.stt { color: #fff59d; }
-    #log .entry.llm { color: #ce93d8; }
-    #log .entry.tts { color: #ffb74d; }
     #log .entry.ttfc { color: #4fc3f7; }
+    #log .entry.stt  { color: #fff59d; }
+    #log .entry.llm  { color: #ce93d8; }
+    #log .entry.tts  { color: #ffb74d; }
     #log .entry.rtf  { color: #a5d6a7; }
   </style>
 </head>
@@ -82,181 +82,154 @@
   <div id="status">Click to start</div>
   <div id="transcript"></div>
   <div id="log"></div>
+  <audio id="audio" autoplay></audio>
 
 <script>
 const btn          = document.getElementById('btn');
-const statusEl     = document.getElementById('status');
-const transcriptEl = document.getElementById('transcript');
+const status       = document.getElementById('status');
+const audio        = document.getElementById('audio');
 const logEl        = document.getElementById('log');
+const transcriptEl = document.getElementById('transcript');
 
-const SAMPLE_RATE  = 16000;
-const CHUNK_MS     = 20;          // send 20 ms PCM chunks
-const CHUNK_FRAMES = SAMPLE_RATE * CHUNK_MS / 1000;  // 320 samples
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
 
-// AudioWorklet processor source (inlined as blob URL)
-const WORKLET_SRC = `
-class CaptureProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._buf = new Float32Array(${CHUNK_FRAMES});
-    this._pos = 0;
-  }
-  process(inputs) {
-    const ch = inputs[0][0];
-    if (!ch) return true;
-    for (let i = 0; i < ch.length; i++) {
-      this._buf[this._pos++] = ch[i];
-      if (this._pos === ${CHUNK_FRAMES}) {
-        this.port.postMessage(this._buf.slice());
-        this._pos = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('capture-processor', CaptureProcessor);
-`;
-
-let ws           = null;
-let audioCtx     = null;
-let workletNode  = null;
-let micSource    = null;
-let micStream    = null;
-let playTime     = 0;     // next scheduled play time in audioCtx seconds
+let pc        = null;
+let dc        = null;
+let pcId      = null;
+let pingTimer = null;
 
 btn.addEventListener('click', () => {
-  if (ws) stop(); else start();
+  if (pc) stop(); else start();
 });
 
 async function start() {
   btn.disabled = true;
   setStatus('Requesting microphone…');
 
+  let stream;
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (e) {
-    setStatus('Microphone denied: ' + e.message);
+    setStatus('Microphone access denied: ' + e.message);
     btn.disabled = false;
     return;
   }
 
-  // Audio context locked to 16 kHz for capture
-  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-  playTime = audioCtx.currentTime;
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-  const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
-  const url  = URL.createObjectURL(blob);
-  await audioCtx.audioWorklet.addModule(url);
-  URL.revokeObjectURL(url);
+  pc.addTransceiver(stream.getAudioTracks()[0], { direction: 'sendrecv' });
+  pc.addTransceiver('video', { direction: 'recvonly' });
 
-  micSource  = audioCtx.createMediaStreamSource(micStream);
-  workletNode = new AudioWorkletNode(audioCtx, 'capture-processor');
+  dc = pc.createDataChannel('pipecat');
 
-  workletNode.port.onmessage = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const f32 = e.data;
-    const i16 = new Int16Array(f32.length);
-    for (let i = 0; i < f32.length; i++) {
-      i16[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32767)));
+  dc.addEventListener('open', () => {
+    pingTimer = setInterval(() => {
+      if (dc.readyState === 'open') dc.send('ping');
+    }, 2000);
+  });
+
+  dc.addEventListener('message', (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg?.type === 'signalling' && msg?.message?.type === 'renegotiate') {
+        renegotiate();
+      } else if (msg?.type === 'log') {
+        appendLog(msg.msg);
+      } else if (msg?.type === 'transcript') {
+        appendTranscript(msg.role, msg.text);
+      }
+    } catch (_) {}
+  });
+
+  pc.addEventListener('track', (e) => {
+    if (e.track.kind === 'audio') {
+      audio.srcObject = new MediaStream([e.track]);
     }
-    ws.send(i16.buffer);
-  };
+  });
 
-  micSource.connect(workletNode);
-  // Don't connect to destination — we don't want mic playback
+  pc.addEventListener('connectionstatechange', () => {
+    const s = pc.connectionState;
+    setStatus(s.charAt(0).toUpperCase() + s.slice(1));
+    if (s === 'failed' || s === 'closed') cleanup();
+  });
 
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.binaryType = 'arraybuffer';
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  setStatus('Connecting…');
+  await waitForIceGathering(pc);
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ label: 'rtvi-ai', type: 'client-ready', version: '1.0' }));
-    setStatus('Handshaking…');
-  };
-
-  ws.onclose = () => {
-    setStatus('Disconnected');
+  let resp;
+  try {
+    resp = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+    });
+  } catch (e) {
+    setStatus('Server unreachable: ' + e.message);
     cleanup();
-  };
+    return;
+  }
 
-  ws.onerror = () => {
-    setStatus('Connection error');
-    cleanup();
-  };
+  if (!resp.ok) { setStatus('Server error ' + resp.status); cleanup(); return; }
 
-  ws.onmessage = (e) => {
-    if (typeof e.data === 'string') {
-      handleJson(e.data);
-    } else {
-      playPcm(e.data);
-    }
-  };
+  const answer = await resp.json();
+  pcId = answer.pc_id;
+  await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+
+  btn.textContent = '⏹';
+  btn.classList.add('active');
+  btn.disabled = false;
+  setStatus('Connected — speak now');
+}
+
+async function renegotiate() {
+  if (!pc) return;
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceGathering(pc);
+
+  const resp = await fetch('/offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sdp: pc.localDescription.sdp,
+      type: pc.localDescription.type,
+      pc_id: pcId,
+    }),
+  });
+  if (!resp.ok) return;
+  const answer = await resp.json();
+  await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
 }
 
 function stop() {
-  if (ws) ws.close();
+  if (dc && dc.readyState === 'open') {
+    dc.send(JSON.stringify({ type: 'signalling', message: { type: 'peerLeft' } }));
+  }
   cleanup();
 }
 
 function cleanup() {
-  if (workletNode) { workletNode.disconnect(); workletNode = null; }
-  if (micSource)   { micSource.disconnect();   micSource = null; }
-  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  if (audioCtx)    { audioCtx.close();         audioCtx = null; }
-  ws = null;
+  clearInterval(pingTimer); pingTimer = null;
+  if (pc) { pc.close(); pc = null; }
+  dc = null; pcId = null;
+  audio.srcObject = null;
   btn.textContent = '🎤';
   btn.classList.remove('active');
   btn.disabled = false;
   setStatus('Click to start');
 }
 
-function playPcm(buffer) {
-  if (!audioCtx) return;
-  const i16 = new Int16Array(buffer);
-  if (!i16.length) return;
-
-  const f32 = new Float32Array(i16.length);
-  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
-
-  const abuf = audioCtx.createBuffer(1, f32.length, SAMPLE_RATE);
-  abuf.getChannelData(0).set(f32);
-
-  const src = audioCtx.createBufferSource();
-  src.buffer = abuf;
-  src.connect(audioCtx.destination);
-
-  const now = audioCtx.currentTime;
-  if (playTime < now) playTime = now;
-  src.start(playTime);
-  playTime += abuf.duration;
-}
-
-function handleJson(raw) {
-  let msg;
-  try { msg = JSON.parse(raw); } catch (_) { return; }
-
-  if (msg.label === 'rtvi-ai' && msg.type === 'bot-ready') {
-    setStatus('Connected — speak now');
-    btn.textContent = '⏹';
-    btn.classList.add('active');
-    btn.disabled = false;
-    return;
-  }
-
-  if (msg.type === 'log') {
-    appendLog(msg.msg);
-  } else if (msg.type === 'transcript') {
-    appendTranscript(msg.role, msg.text);
-  }
-}
-
-function setStatus(msg) { statusEl.textContent = msg; }
+function setStatus(msg) { status.textContent = msg; }
 
 function appendTranscript(role, text) {
   const row = document.createElement('div');
   row.className = 'turn ' + role;
-  row.innerHTML = `<span class="role">${role === 'user' ? 'You' : 'AI'}:</span>`
-                + `<span class="text">${escHtml(text)}</span>`;
+  row.innerHTML = `<span class="role">${role === 'user' ? 'You' : 'AI'}:</span><span class="text">${text}</span>`;
   transcriptEl.appendChild(row);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
@@ -271,13 +244,23 @@ function appendLog(msg) {
             : '';
   const row = document.createElement('div');
   row.className = 'entry' + (cls ? ' ' + cls : '');
-  row.innerHTML = `<span class="ts">${ts}</span>${escHtml(msg)}`;
+  row.innerHTML = `<span class="ts">${ts}</span>${msg}`;
   logEl.appendChild(row);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function waitForIceGathering(pc) {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === 'complete') { resolve(); return; }
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', check);
+    setTimeout(resolve, 3000);
+  });
 }
 </script>
 </body>

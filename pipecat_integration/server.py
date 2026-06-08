@@ -1,35 +1,31 @@
-"""FastAPI server — WebSocket audio pipeline.
-
-Works through SSH tunnels and Vast.ai HTTP proxy (TCP only, no UDP needed).
+"""FastAPI server — WebRTC signaling + pipeline runner.
 
 Run on Vast.ai:
   pip install -e ".[webrtc]"
   python -m pipecat_integration.server --port 8080
 
-Then open  http://localhost:8080  (via SSH tunnel) in your browser.
+Then open  http://<vast-ip>:8080  in your browser.
 """
 
 import argparse
 import asyncio
-import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.workers.runner import WorkerRunner
+from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_response import LLMFullResponseAggregator
 from pipecat.services.whisper.stt import WhisperSTTService
-from pipecat.transports.websocket.fastapi import (
-    FastAPIWebsocketTransport,
-    FastAPIWebsocketParams,
-)
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from pipecat.frames.frames import (
     Frame,
@@ -48,40 +44,22 @@ from pipecat_integration.qwen3_llm_service import LLMUserContextAggregator, Qwen
 
 
 # ---------------------------------------------------------------------------
-# WebSocket channel — thin wrapper so TTS service / logger can send JSON msgs
-# ---------------------------------------------------------------------------
-
-class WsChannel:
-    def __init__(self, ws: WebSocket):
-        self._ws = ws
-
-    def send_app_message(self, msg: dict):
-        asyncio.create_task(self._send(msg))
-
-    async def _send(self, msg: dict):
-        try:
-            await self._ws.send_text(json.dumps(msg))
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Pipeline observer — forwards log/transcript events to the browser
+# Pipeline observer
 # ---------------------------------------------------------------------------
 
 class PipelineLogger(BaseObserver):
-    def __init__(self, channel: WsChannel, timing: dict):
+    def __init__(self, connection: SmallWebRTCConnection, timing: dict):
         super().__init__()
-        self._ch = channel
+        self._conn = connection
         self._timing = timing
         self._llm_buf: list[str] = []
         self._seen_ids: set[int] = set()
 
     def _log(self, msg: str):
-        self._ch.send_app_message({"type": "log", "msg": msg})
+        self._conn.send_app_message({"type": "log", "msg": msg})
 
     def _transcript(self, role: str, text: str):
-        self._ch.send_app_message({"type": "transcript", "role": role, "text": text})
+        self._conn.send_app_message({"type": "transcript", "role": role, "text": text})
 
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
@@ -94,27 +72,21 @@ class PipelineLogger(BaseObserver):
 
         if isinstance(frame, UserStoppedSpeakingFrame):
             self._timing["vad_end_ts"] = time.perf_counter()
-
         elif isinstance(frame, TranscriptionFrame):
             self._log(f"STT: \"{frame.text}\"")
             self._transcript("user", frame.text)
-
         elif isinstance(frame, LLMFullResponseStartFrame):
-            self._log("LLM: generating response")
+            self._log("LLM: generating")
             self._llm_buf = []
-
         elif isinstance(frame, TextFrame):
             self._llm_buf.append(frame.text)
-
         elif isinstance(frame, LLMFullResponseEndFrame):
             full = "".join(self._llm_buf).strip()
             if full:
                 self._transcript("assistant", full)
             self._llm_buf = []
-
         elif isinstance(frame, TTSStartedFrame):
-            self._log("TTS: synthesis started")
-
+            self._log("TTS: started")
         elif isinstance(frame, MetricsFrame):
             pass
 
@@ -136,7 +108,7 @@ _loaded_llm_tokenizer = None
 def _load_tts():
     import torch
     if not torch.cuda.is_available():
-        print("[Startup] No CUDA GPU — TTS skipped (CPU-only mode).")
+        print("[Startup] No CUDA GPU — TTS skipped.")
         return None
     from qwen_tts.megakernel.streaming_tts import StreamingTTSMegakernel
     return StreamingTTSMegakernel(model_name=_cfg["tts_model"], verbose=True)
@@ -185,7 +157,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
 CLIENT_HTML = Path(__file__).parent.parent / "client" / "index.html"
 
 
@@ -193,15 +164,11 @@ CLIENT_HTML = Path(__file__).parent.parent / "client" / "index.html"
 async def health():
     import torch
     cuda = torch.cuda.is_available()
-    llm_ready = _loaded_llm_model is not None
-    tts_ready = _loaded_tts is not None
-    all_ready = llm_ready and (tts_ready or not cuda)
     return JSONResponse({
-        "status": "ok" if all_ready else "loading",
-        "tts": tts_ready,
-        "llm": llm_ready,
+        "status": "ok",
+        "tts": _loaded_tts is not None,
+        "llm": _loaded_llm_model is not None,
         "cuda": cuda,
-        "mode": "gpu" if cuda else "cpu-only (TTS disabled)",
     })
 
 
@@ -210,23 +177,35 @@ async def index():
     return CLIENT_HTML.read_text()
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        await _run_pipeline(websocket)
-    except WebSocketDisconnect:
-        print("WebSocket client disconnected.")
-    except Exception as exc:
-        print(f"Pipeline error: {exc}")
+STUN_SERVERS = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+]
+
+_connections: dict[str, SmallWebRTCConnection] = {}
 
 
-async def _run_pipeline(websocket: WebSocket):
-    channel = WsChannel(websocket)
+@app.post("/offer")
+async def offer(request: Request):
+    data = await request.json()
+    pc_id = data.get("pc_id")
 
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
+    if pc_id and pc_id in _connections:
+        connection = _connections[pc_id]
+        await connection.renegotiate(sdp=data["sdp"], type=data["type"])
+    else:
+        connection = SmallWebRTCConnection(ice_servers=STUN_SERVERS)
+        await connection.initialize(sdp=data["sdp"], type=data["type"])
+        _connections[connection.pc_id] = connection
+        asyncio.create_task(_run_pipeline(connection))
+
+    return JSONResponse(connection.get_answer())
+
+
+async def _run_pipeline(connection: SmallWebRTCConnection):
+    transport = SmallWebRTCTransport(
+        webrtc_connection=connection,
+        params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
@@ -264,7 +243,7 @@ async def _run_pipeline(websocket: WebSocket):
     assistant_agg = LLMFullResponseAggregator()
 
     timing = {"vad_end_ts": 0.0}
-    obs = PipelineLogger(channel, timing)
+    obs = PipelineLogger(connection, timing)
 
     if _loaded_tts is not None:
         tts = MegakernelTTSService(
@@ -272,7 +251,7 @@ async def _run_pipeline(websocket: WebSocket):
             sample_rate=sample_rate,
             verbose=False,
             tts_instance=_loaded_tts,
-            connection=channel,
+            connection=connection,
             timing=timing,
         )
         stages = [
@@ -280,7 +259,7 @@ async def _run_pipeline(websocket: WebSocket):
             tts, transport.output(), assistant_agg,
         ]
     else:
-        print("[Pipeline] Running in CPU-only mode — no TTS output.")
+        print("[Pipeline] CPU-only mode — no TTS.")
         stages = [
             transport.input(), stt, user_agg, llm, splitter,
             transport.output(), assistant_agg,
@@ -295,12 +274,12 @@ async def _run_pipeline(websocket: WebSocket):
             observers=[obs],
         ),
     )
-    runner = WorkerRunner()
-    await runner.add_workers(task)
+    runner = PipelineRunner()
 
-    print("WebSocket client connected — pipeline running.")
-    await runner.run()
-    print("WebSocket pipeline finished.")
+    print("WebRTC client connected — pipeline running.")
+    await runner.run(task)
+    _connections.pop(connection.pc_id, None)
+    print("WebRTC client disconnected.")
 
 
 # ---------------------------------------------------------------------------
@@ -308,12 +287,12 @@ async def _run_pipeline(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Qwen3-TTS megakernel WebSocket server")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--tts-model", default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
     parser.add_argument("--speaker", default="aiden")
-    parser.add_argument("--whisper-model", default="base", help="tiny|base|small|medium|large-v3")
+    parser.add_argument("--whisper-model", default="base")
     args = parser.parse_args()
 
     _cfg.update(
@@ -323,12 +302,10 @@ if __name__ == "__main__":
     )
 
     print(
-        f"\nStarting WebSocket server\n"
+        f"\nStarting WebRTC server\n"
         f"  STT : Faster-Whisper {args.whisper_model}\n"
-        f"  LLM : Qwen3-0.6B-Instruct\n"
-        f"  TTS : Megakernel {args.tts_model} speaker={args.speaker}\n\n"
-        f"  Open in browser:  http://localhost:{args.port}\n"
-        f"  (SSH tunnel: ssh -L {args.port}:localhost:{args.port} user@vast-ip)\n"
+        f"  LLM : Qwen3-0.6B\n"
+        f"  TTS : {args.tts_model}\n\n"
+        f"  Open: http://<vast-ip>:{args.port}\n"
     )
-
     uvicorn.run(app, host=args.host, port=args.port)
