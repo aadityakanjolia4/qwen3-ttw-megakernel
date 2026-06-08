@@ -149,12 +149,8 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
                 yield frame
                 if not ttfc_logged and first_chunk_ts and self._log_callback is not None:
                     ttfc_logged = True
-                    vad_ts = self._timing.get("vad_end_ts") if self._timing else 0.0
-                    if vad_ts:
-                        ttfc_ms = (first_chunk_ts[0] - vad_ts) * 1000
-                        # TTFC = VAD end → first audio chunk sent to browser
-                        # includes STT + LLM first sentence + TTS first chunk
-                        self._log_callback({"type": "log", "msg": f"TTFC: {ttfc_ms:.0f} ms  (VAD→STT→LLM→TTS first chunk)"})
+                    ttfc_ms = (first_chunk_ts[0] - t0) * 1000
+                    self._log_callback({"type": "log", "msg": f"TTFC: {ttfc_ms:.0f} ms"})
             except asyncio.TimeoutError:
                 if synthesis_future.done():
                     done = True
@@ -173,8 +169,7 @@ class MegakernelTTSService(TTSService if _PIPECAT_AVAILABLE else object):
             rtf = elapsed / audio_duration
             self._log_callback({"type": "log", "msg": f"RTF: {rtf:.3f}  ({elapsed*1000:.0f}ms for {audio_duration:.2f}s audio)"})
             if self._verbose:
-                ttfc_ms = (first_chunk_ts[0] - self._timing["vad_end_ts"]) * 1000 if (first_chunk_ts and self._timing and self._timing.get("vad_end_ts")) else None
-                ttfc_str = f"{ttfc_ms:.0f}ms" if ttfc_ms is not None else "n/a"
+                ttfc_str = f"{(first_chunk_ts[0] - t0)*1000:.0f}ms" if first_chunk_ts else "n/a"
                 print(f"[TTS] '{sentence[:40]}' TTFC={ttfc_str} RTF={rtf:.3f}")
 
     # ------------------------------------------------------------------
