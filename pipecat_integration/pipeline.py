@@ -37,16 +37,15 @@ def _build_local_transport():
         )
         sys.exit(1)
 
-    transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
-        )
+    params = LocalAudioTransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+        vad_audio_passthrough=True,
     )
-    sample_rate = transport.get_params().audio_out_sample_rate
+    transport = LocalAudioTransport(params)
+    sample_rate = params.audio_out_sample_rate or 16000
     return transport, sample_rate
 
 
@@ -70,7 +69,7 @@ def build_pipeline(
         LLMAssistantResponseAggregator,
         LLMUserResponseAggregator,
     )
-    from pipecat.services.whisper import Model, WhisperSTTService
+    from pipecat.services.whisper.stt import WhisperSTTService
 
     from pipecat_integration.megakernel_tts_service import MegakernelTTSService
     from pipecat_integration.qwen3_llm_service import Qwen3LLMService, SentenceSplitter
@@ -78,7 +77,7 @@ def build_pipeline(
     transport, sample_rate = _build_local_transport()
 
     # STT: Faster-Whisper (local).
-    stt = WhisperSTTService(model=Model(whisper_model))
+    stt = WhisperSTTService(settings=WhisperSTTService.Settings(model=whisper_model))
 
     # LLM: Qwen3-0.6B-Instruct (local HF, direct inference, /no_think).
     llm = Qwen3LLMService(
@@ -162,7 +161,7 @@ async def main(args):
 
     task = PipelineTask(
         pipeline,
-        PipelineParams(allow_interruptions=True, enable_metrics=True),
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
     )
 
     runner = PipelineRunner()
